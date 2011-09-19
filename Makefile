@@ -10,6 +10,6 @@ else
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
 clean:
-	$(RM) *.o *.ko *.mod.c Module.symvers .lx_* modules.order
+	$(RM) *.o *.ko *.mod.c Module.symvers .lx* modules.order
 	$(RM) -r .tmp_versions
 endif

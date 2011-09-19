@@ -434,8 +434,8 @@ static struct drm_mode_config_funcs lx_mode_funcs = {
 
 static const int connector_best_encoders[LX_NUM_CONNECTORS] = {
 	[LX_CONNECTOR_VGA] = LX_ENCODER_DAC,
-	[LX_CONNECTOR_LVDS] = LX_ENCODER_LVDS, /* PANEL */
-	[LX_CONNECTOR_VOP] = LX_ENCODER_BYPASS, /* VOP */
+	[LX_CONNECTOR_LVDS] = LX_ENCODER_PANEL,
+	[LX_CONNECTOR_VOP] = LX_ENCODER_VOP,
 	[LX_CONNECTOR_COMPANION] = LX_ENCODER_BYPASS, /* DRGB */
 };
 
@@ -570,7 +570,9 @@ static int lx_connector_mode_valid(struct drm_connector *connector,
 				   struct drm_display_mode *mode)
 {
 	struct lx_connector *lx_conn = to_lx_connector(connector);
-	int ret = lx_graphic_mode_valid(mode, NULL, NULL);
+	int ret;
+
+	ret = lx_graphic_mode_valid(mode, NULL, NULL);
 	if (ret != MODE_OK)
 		return ret;
 
@@ -850,9 +852,9 @@ static void lx_encoder_dac_mode_set(struct drm_encoder *encoder,
 
 	switch (lx_enc->id) {
 	case LX_ENCODER_DAC:
-	case LX_ENCODER_LVDS:
+	case LX_ENCODER_PANEL:
 		cloned  = priv->encoders[LX_ENCODER_DAC].enabled;
-		cloned &= priv->encoders[LX_ENCODER_LVDS].enabled;
+		cloned &= priv->encoders[LX_ENCODER_PANEL].enabled;
 		if (cloned) {
 			lo |= MSR_VP_GLD_MSR_CONFIG_FMT_FP;
 			lo |= MSR_VP_GLD_MSR_CONFIG_FPC;
@@ -901,8 +903,8 @@ static struct {
 	const struct drm_encoder_helper_funcs *hfuncs;
 } const lx_encoder_types[LX_NUM_ENCODERS] = {
 	[LX_ENCODER_DAC]    = { DRM_MODE_ENCODER_DAC, &lx_encoder_dac_helper_funcs },
-	[LX_ENCODER_LVDS]   = { DRM_MODE_ENCODER_LVDS, },
-	[LX_ENCODER_TVDAC]  = { DRM_MODE_ENCODER_TVDAC, },
+	[LX_ENCODER_PANEL]  = { DRM_MODE_ENCODER_LVDS, },
+	[LX_ENCODER_VOP]    = { DRM_MODE_ENCODER_TVDAC, },
 	[LX_ENCODER_BYPASS] = { DRM_MODE_ENCODER_NONE, },
 };
 
@@ -1503,9 +1505,9 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 
 	if (encoders == BIT_MASK(LX_ENCODER_DAC))
 		lo |= MSR_VP_GLD_MSR_CONFIG_FMT_CRT;
-	else if (encoders & BIT_MASK(LX_ENCODER_LVDS))
+	else if (encoders & BIT_MASK(LX_ENCODER_PANEL))
 		lo |= MSR_VP_GLD_MSR_CONFIG_FMT_FP;
-	else if (encoders & BIT_MASK(LX_ENCODER_TVDAC))
+	else if (encoders & BIT_MASK(LX_ENCODER_VOP))
 		lo |= MSR_VP_GLD_MSR_CONFIG_FMT_VOP;
 	else if (encoders == BIT_MASK(LX_ENCODER_BYPASS)) {
 		lo |= MSR_VP_GLD_MSR_CONFIG_FMT_DRGB;
@@ -1513,7 +1515,7 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 		/* TODO: set interchange UV [14] based on drm-property */
 	}
 
-	if (encoders & (BIT_MASK(LX_ENCODER_LVDS) | BIT_MASK(LX_ENCODER_TVDAC)))
+	if (encoders & (BIT_MASK(LX_ENCODER_PANEL) | BIT_MASK(LX_ENCODER_VOP)))
 		lo |= MSR_VP_GLD_MSR_CONFIG_FPC;
 
 	wrmsr(LX_MSR(LX_VP, LX_GLD_MSR_CONFIG), lo, hi);
@@ -1984,8 +1986,9 @@ static int lx_map_video_memory(struct pci_dev *pdev, struct lx_priv *priv) {
 	write_dc(priv, DC_GLIU0_MEM_OFFSET, priv->vmem_phys & 0xFF000000);
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 
-	DRV_INFO("%d KB of video memory at linear address 0x%x\n",
-		 priv->vmem_size / 1024, priv->vmem_phys);
+	DRV_INFO("%lu KB of video memory at linear address 0x%lx\n",
+		 (unsigned long)priv->vmem_size / 1024,
+		 (unsigned long)priv->vmem_phys);
 
 	return 0;
 

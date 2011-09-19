@@ -42,10 +42,9 @@ enum lx_connectors {
 #define LX_NUM_ENCODERS		4
 enum lx_encoders {
 	LX_ENCODER_DAC, /* RGB [CRT]*/
-	LX_ENCODER_LVDS, /* digital RGB [Panel] */
-	LX_ENCODER_TVDAC, /* YUV [VOP] */
+	LX_ENCODER_PANEL, /* digital RGB [Panel] */
+	LX_ENCODER_VOP, /* YUV [VOP] */
 	LX_ENCODER_BYPASS, /* digital RGB w/o mixing/overlay/alpha-blending or gamma correction -> to companion chip [bypass] */
-	/* VOP? */
 };
 
 /* video: scaling + mixer -> output also to VOP
