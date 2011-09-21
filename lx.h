@@ -435,7 +435,7 @@ enum dc_registers {
 # define DC_IRQ_STATUS			(1 << 16)
 #endif
 
-#define DC_IRQ_VIP_VSYNC_LOSS_IRQ_MASK	(1 << 1)
+#define DC_IRQ_VIP_VSYNC_IRQ_MASK	(1 << 1)
 #define DC_IRQ_MASK			(1 << 0)
 
 #define DC_GENLK_CTL_FLICK_SEL_MASK	(0x0F << 28)

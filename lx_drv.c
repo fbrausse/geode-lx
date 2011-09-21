@@ -1518,7 +1518,7 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 	 * DC_GFX_SCALE, DC_IRQ_FILT_CTL and DC_FILT_COEFF(1|2) */
 
 	/* vscale / hscale, format: fixed 2.14 */
-	write_dc(priv, DC_GFX_SCALE, 0x3000 << 16 | 0x3000);
+	write_dc(priv, DC_GFX_SCALE, 0x4000 << 16 | 0x4000);
 
 	/* trigger line count IRQ when vblank starts (if IRQ is enabled) */
 	/* TODO: graphics/flicker/alpha filter, interlacing */
@@ -1943,8 +1943,8 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags) {
 
 	lx_modeset_init(dev);
 
-	// drm_irq_install(dev);
-	// drm_vblank_init(dev, LX_NUM_CRTCS);
+	drm_irq_install(dev);
+	drm_vblank_init(dev, 1 /* TODO: LX_NUM_CRTCS */);
 
 	rdmsr(0xa0002001, lo, hi);
 	DRM_DEBUG_DRIVER("GP GLD config: %08x\n", lo);
@@ -1992,8 +1992,9 @@ failed_map_video_memory:
 
 int lx_driver_unload(struct drm_device *dev) {
 	struct lx_priv *priv = dev->dev_private;
-	// drm_vblank_cleanup(dev);
-	// drm_irq_uninstall(dev);
+	drm_vblank_off(dev, LX_CRTC_GRAPHIC);
+	drm_vblank_cleanup(dev);
+	drm_irq_uninstall(dev);
 	lx_modeset_cleanup(dev);
 	lx_unmap_video_memory(dev->pdev, priv);
 	kfree(priv);
@@ -2028,11 +2029,13 @@ static int lx_driver_enable_vblank(struct drm_device *dev, int crtc) {
 	u32 dc_irq_filt_ctl;
 	u32 dc_irq;
 
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+
 	/* set line counter */
 	dc_irq_filt_ctl = read_dc(priv, DC_IRQ_FILT_CTL);
 	dc_irq_filt_ctl &= ~(((1 << 11) - 1) << 16); /* clear bits [26:16] */
 	/* set IRQ trigger value there */
-	dc_irq_filt_ctl |= mode->crtc_vblank_start << 16;
+	dc_irq_filt_ctl |= (mode->crtc_vblank_start - 100) << 16;
 	write_dc(priv, DC_IRQ_FILT_CTL, dc_irq_filt_ctl);
 
 	/* enable line count interrupt */
@@ -2041,7 +2044,10 @@ static int lx_driver_enable_vblank(struct drm_device *dev, int crtc) {
 	dc_irq &= ~DC_IRQ_MASK; /* unmask line cnt interrupt */
 	write_dc(priv, DC_IRQ, dc_irq);
 
-	DRM_DEBUG_DRIVER("crtc: %d\n", crtc);
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+
+	DRM_DEBUG_DRIVER("crtc: %d, filt: %08x, dc_irq: %08x\n",
+			 crtc, dc_irq_filt_ctl, dc_irq);
 	return 0;
 }
 
@@ -2061,12 +2067,16 @@ static void lx_driver_disable_vblank(struct drm_device *dev, int crtc) {
 	if (crtc < 0 || crtc >= LX_NUM_CRTCS)
 		return;
 
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+
 	dc_irq = read_dc(priv, DC_IRQ);
 	dc_irq &= ~LX_IRQ_STATUS_MASK; /* don't clear any interrupt status bits */
 	dc_irq |= DC_IRQ_MASK; /* mask line cnt interrupt */
 	write_dc(priv, DC_IRQ, dc_irq);
 
-	DRM_DEBUG_DRIVER("crtc: %d\n", crtc);
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+
+	DRM_DEBUG_DRIVER("crtc: %d, dc_irq: %08x\n", crtc, dc_irq);
 }
 
 /* --------------------------------------------------------------------------
@@ -2082,15 +2092,18 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS) {
 	 {
 		dc_irq = read_dc(priv, DC_IRQ);
 
-		gp_irq = read_gp(priv, GP_INT_CNTRL);
-		// write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
+		write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+		write_dc(priv, DC_IRQ, dc_irq); /* clear DC IRQ status */
+		write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 
-		DRM_DEBUG_DRIVER("IRQ: dc: %08x, gp: %08x\n", dc_irq, gp_irq);
-#if 0
-		if (!(dc_irq & LX_IRQ_STATUS_MASK) &&
-		    !(gp_irq & LX_IRQ_STATUS_MASK))
-			return ret;
-#endif
+		// gp_irq = read_gp(priv, GP_INT_CNTRL);
+/*
+		DRM_DEBUG_DRIVER("IRQ: dc old: %08x, new: %08x\n",
+				 dc_irq, read_dc(priv, DC_IRQ));
+*/
+		dc_irq &= ~(dc_irq << 16); /* clear all masked interrupts */
+		// gp_irq &= ~(gp_irq << 16); /* clear all masked interrupts */
+
 		if (dc_irq & DC_IRQ_STATUS) {
 			DRM_DEBUG_DRIVER("IRQ: vline\n");
 			drm_handle_vblank(dev, LX_CRTC_GRAPHIC);
@@ -2099,13 +2112,15 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS) {
 			/* TODO: process any page flips, etc. */
 		}
 
+/*
 		if (gp_irq & GP_INT_IDLE_STATUS) {
 		}
 		if (gp_irq & GP_INT_CMD_BUF_EMPTY_STATUS) {
 		}
-
+*/
 		/* clear DC IRQ status */
-		write_dc(priv, DC_IRQ, DC_IRQ_STATUS | ~LX_IRQ_STATUS_MASK);
+		// write_dc(priv, DC_IRQ, DC_IRQ_STATUS | ~LX_IRQ_STATUS_MASK);
+		// write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
 	}
 	return ret;
 }
@@ -2117,9 +2132,9 @@ static void lx_driver_irq_preinstall(struct drm_device *dev) {
 	/* TODO: disable all interrupts */
 
 	/* DC: line cnt & vip vsync loss interrupts */
-	write_dc(priv, DC_IRQ, ~LX_IRQ_STATUS_MASK);
+	write_dc(priv, DC_IRQ, DC_IRQ_MASK | DC_IRQ_VIP_VSYNC_IRQ_MASK);
 	/* GP: idle & cmd buffer empty */
-	write_gp(priv, GP_INT_CNTRL, ~LX_IRQ_STATUS_MASK);
+	write_gp(priv, GP_INT_CNTRL, GP_INT_IDLE_MASK | GP_INT_CMD_BUF_EMPTY_MASK);
 }
 
 static int lx_driver_irq_postinstall(struct drm_device *dev) {
