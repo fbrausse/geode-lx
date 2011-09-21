@@ -25,27 +25,45 @@
 #include <ttm/ttm_module.h>
 #include <ttm/ttm_page_alloc.h>
 
+
 /* VGA <- DAC 24 bit (video/graphics input)
  * LVDS <- LVDS 24 bit (video/graphics input) several bit depths
  * COMPANION <- other (bypass) 24 bit + 3 bit (delay) (graphics input)
  * TV <- TV (video/graphics input) several bit depths?
  * VOP <- (video/graphics input) */
 
-#define LX_NUM_CONNECTORS	4
+#define LX_NUM_CONNECTORS	3
 enum lx_connectors {
 	LX_CONNECTOR_VGA,
 	LX_CONNECTOR_LVDS,
-	LX_CONNECTOR_COMPANION, /* DRGB, see VP's GLD_MSR_CONFIG[5:3] */
 	LX_CONNECTOR_VOP,
 };
 
-#define LX_NUM_ENCODERS		4
+#define LX_NUM_ENCODERS		2
 enum lx_encoders {
 	LX_ENCODER_DAC, /* RGB [CRT]*/
 	LX_ENCODER_PANEL, /* digital RGB [Panel] */
-	LX_ENCODER_VOP, /* YUV [VOP] */
-	LX_ENCODER_BYPASS, /* digital RGB w/o mixing/overlay/alpha-blending or gamma correction -> to companion chip [bypass] */
+	// LX_ENCODER_VOP, /* YUV [VOP] */
+	// LX_ENCODER_BYPASS, /* digital RGB w/o mixing/overlay/alpha-blending or gamma correction -> to companion chip [bypass] */
 };
+
+/* encoders: 3-bit value: abc
+ * c:
+ * ~
+ * 0: primary analog CRT
+ * 1: primary digital TFT (+ optionally cloned CRT)
+ * 
+ * ab:
+ * ~~
+ * 00: normal operation: either CRT only or TFT + optionally cloned CRT
+ * 01: legacy mode: optionally cloned CRT + either RGB_565 or RGB 888 (via companion chip, if connected)
+ * 10: debug mode: debug signals on DRGB_565 and/or RGB_323 on the low bits (+ optionally cloned CRT?)
+ * 11: alternate configuration: VOP / "DRGB"
+ *
+ * this suggests the following
+ *   connectors: VGA, LVDS
+ *   encoders: DAC, {PANEL, VOP, DRGB}
+ */
 
 /* video: scaling + mixer -> output also to VOP
  * graphics: mixer -> output also to VOP
@@ -55,8 +73,9 @@ enum lx_encoders {
 enum lx_crtcs {
 	LX_CRTC_GRAPHIC,
 	LX_CRTC_VIDEO,
-	/* LX_CRTC_COMPANION? */
 };
+
+
 
 #define to_lx_connector(connector)	\
 		container_of(connector, struct lx_connector, base)
@@ -64,6 +83,9 @@ struct lx_connector {
 	struct drm_connector base;
 
 	enum lx_connectors id;
+
+	unsigned max_width, max_height, max_hz;
+	struct edid *edid;
 };
 
 #define to_lx_encoder(encoder)		\
@@ -150,11 +172,10 @@ extern void lx_ddc_cleanup(struct drm_device *dev);
 
 
 #define LX_DOTPLL_MINKHZ		15000
-#define LX_MODE_FREQ_TOL		 4000   /* in kHz */
+#define LX_MODE_MAX_VFREQ		100    /* in Hz */
+#define LX_MODE_FREQ_TOL		4000   /* in kHz */
 
-#define LX_MODE_PFLAG_DOTPLL_MASK	0x17fff
-
-
+#define LX_MODE_PFLAG_DOTPLL_MASK	0x17fff /* private_flags */
 
 
 #define LX_MC				0x20 /* memory controller */

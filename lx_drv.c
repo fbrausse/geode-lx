@@ -164,6 +164,42 @@ static s32 lx_find_matching_pll(u32 *freq_khz, u32 freq_tolerance) {
 	return divided | lx_pll_freq[min_idx].pllval;
 }
 
+static int lx_graphic_mode_valid(const struct drm_display_mode *mode,
+				 u32 *fixed_freq, u32 *pllval)
+{
+	/* TODO: check crtc_* instead */
+
+	u32 freq = mode->clock;
+	s32 ret;
+
+	if (mode->hdisplay < 64 || (mode->htotal - 1) >> 12)
+		return MODE_H_ILLEGAL;
+	if (mode->hsync_start - mode->hdisplay < 8)
+		return MODE_HBLANK_NARROW;
+	if (mode->hsync_end - mode->hsync_start < 8)
+		return MODE_HSYNC_NARROW;
+	/* no requirement for hdisplay / htotal / hsync_(start|stop) being a
+	 * multiple of 8 anymore on this chip */
+
+	if (mode->flags & DRM_MODE_FLAG_INTERLACE) {
+		/* #total lines in interlaced mode must be odd */
+		if (!(mode->vtotal & 1))
+			return MODE_BAD_VVALUE;
+	}
+	/* no requirement for vdisplay / vtotal / vsync_(start|stop) being a
+	 * multiple of 8 anymore on this chip */
+
+	ret = lx_find_matching_pll(&freq, LX_MODE_FREQ_TOL);
+	if (ret < 0)
+		return -ret;
+	if (fixed_freq)
+		*fixed_freq = freq;
+	if (pllval)
+		*pllval = ret;
+
+	return MODE_OK;
+}
+
 
 /* --------------------------------------------------------------------------
  * FB
@@ -295,6 +331,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	info->fix.smem_start = priv->vmem_phys;
 	info->fix.smem_len = size;
+	/* TODO: use drm_local_map's handle here */
 	info->screen_base = ioremap(priv->vmem_phys, size);
 	info->screen_size = size;
 
@@ -432,23 +469,9 @@ static struct drm_mode_config_funcs lx_mode_funcs = {
  * Connector
  * -------------------------------------------------------------------------- */
 
-static const int connector_best_encoders[LX_NUM_CONNECTORS] = {
-	[LX_CONNECTOR_VGA] = LX_ENCODER_DAC,
-	[LX_CONNECTOR_LVDS] = LX_ENCODER_PANEL,
-	[LX_CONNECTOR_VOP] = LX_ENCODER_VOP,
-	[LX_CONNECTOR_COMPANION] = LX_ENCODER_BYPASS, /* DRGB */
-};
-
 static struct drm_encoder * lx_connector_best_encoder(
-					struct drm_connector *connector)
-{
-	struct lx_priv *priv = connector->dev->dev_private;
-	struct lx_connector *lx_conn = to_lx_connector(connector);
-	enum lx_encoders encoder_id = connector_best_encoders[lx_conn->id];
-	return &priv->encoders[encoder_id].base;
-}
+					struct drm_connector *connector);
 
-/*
 static struct drm_encoder * lx_connector_attached_encoder(
 		struct drm_connector *connector)
 {
@@ -469,139 +492,133 @@ static struct drm_encoder * lx_connector_attached_encoder(
 	}
 
 	return NULL;
-}*/
+}
 
-static enum drm_connector_status lx_connector_vga_detect(
+static bool lx_connector_get_edid(struct drm_connector *connector,
+				  struct i2c_adapter *ddc, bool verbose)
+{
+	struct lx_connector *lx_conn = to_lx_connector(connector);
+	struct edid *edid = NULL;
+
+	kfree(lx_conn->edid);
+	
+	if (!ddc)
+		goto out;
+	if (!lx_ddc_probe(ddc))
+		goto out;
+
+	edid = drm_get_edid(connector, ddc);
+
+	if (!edid) {
+		if (verbose)
+			DRV_INFO("failed to retrieve EDID for %s\n",
+				 drm_get_connector_name(connector));
+	} else if (!drm_edid_is_valid(edid)) {
+		if (verbose)
+			DRV_INFO("EDID retrieved for %s is invalid\n",
+				 drm_get_connector_name(connector));
+		connector->display_info.raw_edid = NULL;
+		kfree(edid);
+		edid = NULL;
+	}
+
+out:
+	/* In any case update the edid property to reflect the current status */
+	drm_mode_connector_update_edid_property(connector, edid);
+	lx_conn->edid = edid;
+
+	return edid != NULL;
+}
+
+static enum drm_connector_status lx_connector_detect(
 		struct drm_connector *connector, bool force)
 {
 	struct lx_priv *priv = connector->dev->dev_private;
+	struct lx_connector *lx_conn = to_lx_connector(connector);
 	struct drm_encoder *encoder;
 	struct drm_encoder_helper_funcs *encoder_funcs;
+	struct drm_connector_helper_funcs *connector_funcs;
+	enum drm_connector_status status = connector_status_unknown;
 
-	if (priv->ddc && lx_ddc_probe(priv->ddc))
-		return connector_status_connected;
+	switch (lx_conn->id) {
+	case LX_CONNECTOR_VGA:
+		if (lx_connector_get_edid(connector, priv->ddc, false))
+			status = connector_status_connected;
+		break;
+	}
 
-	if (force) {
-		encoder = lx_connector_best_encoder(connector);
+	if (force && status == connector_status_unknown) {
+		connector_funcs = connector->helper_private;
+		encoder = connector_funcs->best_encoder(connector);
 		if (encoder) {
 			encoder_funcs = encoder->helper_private;
-			return encoder_funcs->detect(encoder, connector);
+			status = encoder_funcs->detect(encoder, connector);
 		}
 	}
 
-	return connector->status;
-}
-
-/** Called through drm_connector_helper_funcs by
- * drm_helper_probe_single_connector_modes.
- *
- * Probes the connector for modes or adds some default modes provided by
- * DRM EDID and returns the number of modes successfully added.
- */
-static int lx_connector_vga_get_modes(struct drm_connector *connector)
-{
-	struct lx_priv *priv = connector->dev->dev_private;
-	struct edid *edid = NULL;
-	int num_modes;
-
-	if (priv->ddc) {
-		edid = drm_get_edid(connector, priv->ddc);
-		if (!edid) {
-			DRM_INFO("lx: failed to retrieve EDID via builtin DDC\n");
-		} else if (!drm_edid_is_valid(edid)) {
-			DRM_INFO("lx: EDID retrieved via builtin DDC is invalid\n");
-			kfree(connector->display_info.raw_edid);
-			connector->display_info.raw_edid = NULL;
-			edid = NULL;
-		}
-	}
-
-	if (edid) {
-		num_modes = drm_add_edid_modes(connector, edid);
-	} else {
-		num_modes = drm_add_modes_noedid(connector, 1920, 1440);
-	}
-	DRM_INFO("lx: added %d %s modes for connector %s\n", num_modes,
-		 edid ? "EDID" : "static", drm_get_connector_name(connector));
-
-	/* In any case update the edid property to reflect the current status */
-	drm_mode_connector_update_edid_property(connector, edid);
-
-	return num_modes;
-}
-
-static int lx_graphic_mode_valid(const struct drm_display_mode *mode,
-				 u32 *fixed_freq, u32 *pllval)
-{
-	/* TODO: check crtc_* instead */
-
-	u32 freq = mode->clock;
-	s32 ret;
-
-	if (mode->hdisplay < 64 || (mode->htotal - 1) >> 12)
-		return MODE_H_ILLEGAL;
-	if (mode->hsync_start - mode->hdisplay < 8)
-		return MODE_HBLANK_NARROW;
-	if (mode->hsync_end - mode->hsync_start < 8)
-		return MODE_HSYNC_NARROW;
-	/* no requirement for hdisplay / htotal / hsync_(start|stop) being a
-	 * multiple of 8 anymore on this chip */
-
-	if (mode->flags & DRM_MODE_FLAG_INTERLACE) {
-		/* #total lines in interlaced mode must be odd */
-		if (!(mode->vtotal & 1))
-			return MODE_BAD_VVALUE;
-	}
-	/* no requirement for vdisplay / vtotal / vsync_(start|stop) being a
-	 * multiple of 8 anymore on this chip */
-
-	ret = lx_find_matching_pll(&freq, LX_MODE_FREQ_TOL);
-	if (ret < 0)
-		return -ret;
-	if (fixed_freq)
-		*fixed_freq = freq;
-	if (pllval)
-		*pllval = ret;
-
-	return MODE_OK;
+	return status;
 }
 
 static int lx_connector_mode_valid(struct drm_connector *connector,
 				   struct drm_display_mode *mode)
 {
 	struct lx_connector *lx_conn = to_lx_connector(connector);
-	int ret;
 
-	ret = lx_graphic_mode_valid(mode, NULL, NULL);
-	if (ret != MODE_OK)
-		return ret;
-
-	if (mode->vrefresh > 100)
+	if (mode->vrefresh > LX_MODE_MAX_VFREQ)
 		return MODE_CLOCK_HIGH;
 
-	switch (lx_conn->id) {
-	case LX_CONNECTOR_VGA:
-		if (mode->hdisplay > 1920)
-			return MODE_BAD_HVALUE;
-		if (mode->vdisplay > 1440)
-			return MODE_BAD_VVALUE;
-		if (mode->hdisplay == 1920 && mode->vdisplay == 1440 &&
-		    mode->vrefresh > 85)
-			return MODE_CLOCK_HIGH;
-		if (mode->clock > 340000 + LX_MODE_FREQ_TOL)
-			return MODE_CLOCK_HIGH;
-		break;
-	case LX_CONNECTOR_LVDS:
-		if (mode->hdisplay > 1600)
-			return MODE_BAD_HVALUE;
-		if (mode->vdisplay > 1200)
-			return MODE_BAD_VVALUE;
-		if (mode->clock > 170000 + LX_MODE_FREQ_TOL)
-			return MODE_CLOCK_HIGH;
-		break;
-	}
+	if (lx_conn->max_hz && mode->clock - LX_MODE_FREQ_TOL > lx_conn->max_hz)
+		return MODE_CLOCK_HIGH;
 
-	return MODE_OK;
+	if (lx_conn->max_width && mode->hdisplay > lx_conn->max_width)
+		return MODE_BAD_HVALUE;
+
+	if (lx_conn->max_height && mode->vdisplay > lx_conn->max_height)
+		return MODE_BAD_VVALUE;
+
+	return lx_graphic_mode_valid(mode, NULL, NULL);
+}
+
+static void lx_connector_destroy(struct drm_connector *connector)
+{
+	struct lx_connector *lx_conn = to_lx_connector(connector);
+
+	DRM_DEBUG_DRIVER("\n");
+
+	/* TODO: switch off outputs? */
+
+	drm_sysfs_connector_remove(connector);
+	drm_connector_cleanup(connector);
+
+	if (lx_conn->edid)
+		kfree(lx_conn->edid);
+
+	/* TODO: release & cleanup output device(s) / registers */
+}
+
+/** Called through drm_connector_helper_funcs by
+ * drm_helper_probe_single_connector_modes.
+ *
+ * Probes the connector for modes or adds some default modes provided by
+ * EDID and returns the number of modes successfully added.
+ */
+static int lx_connector_vga_get_modes(struct drm_connector *connector)
+{
+	struct lx_priv *priv = connector->dev->dev_private;
+	struct lx_connector *lx_conn = to_lx_connector(connector);
+	bool have_edid = lx_connector_get_edid(connector, priv->ddc, true);
+	int num_modes;
+
+	if (have_edid) {
+		num_modes = drm_add_edid_modes(connector, lx_conn->edid);
+	} else {
+		num_modes = drm_add_modes_noedid(connector, 1920, 1440);
+	}
+	DRV_INFO("added %d %s modes for connector %s\n", num_modes,
+		 have_edid ? "EDID" : "static",
+		 drm_get_connector_name(connector));
+
+	return num_modes;
 }
 
 static void lx_connector_vga_reset(struct drm_connector *connector) {
@@ -620,18 +637,6 @@ static void lx_connector_vga_reset(struct drm_connector *connector) {
 	write_vp(priv, VP_DCFG, dcfg);
 }
 
-static void lx_connector_vga_destroy(struct drm_connector *connector)
-{
-	DRM_DEBUG_DRIVER("\n");
-
-	/* TODO: switch off outputs? */
-
-	drm_sysfs_connector_remove(connector);
-	drm_connector_cleanup(connector);
-
-	/* TODO: release & cleanup output device(s) / registers */
-}
-
 static const struct drm_connector_helper_funcs lx_connector_vga_helper_funcs = {
 	.get_modes	= lx_connector_vga_get_modes,
 	.mode_valid	= lx_connector_mode_valid,
@@ -640,30 +645,47 @@ static const struct drm_connector_helper_funcs lx_connector_vga_helper_funcs = {
 
 static const struct drm_connector_funcs lx_connector_vga_funcs = {
 	.dpms		= drm_helper_connector_dpms,
-	.detect		= lx_connector_vga_detect,
+	.detect		= lx_connector_detect,
 	.fill_modes	= drm_helper_probe_single_connector_modes,
-	.destroy	= lx_connector_vga_destroy,
+	.destroy	= lx_connector_destroy,
 	.reset		= lx_connector_vga_reset,
 #if 0
 	void (*save)(struct drm_connector *connector);
 	void (*restore)(struct drm_connector *connector);
 
-	int (*set_property)(struct drm_connector *connector, struct drm_property *property,
-			     uint64_t val);
+	int (*set_property)(struct drm_connector *connector,
+			    struct drm_property *property,
+			    uint64_t val);
 	void (*force)(struct drm_connector *connector);
 #endif
 };
 
 static struct {
 	int type;
+	int encoder;
 	const struct drm_connector_funcs *funcs;
 	const struct drm_connector_helper_funcs *hfuncs;
 } const lx_connector_types[LX_NUM_CONNECTORS] = {
-	[LX_CONNECTOR_VGA]       = { DRM_MODE_CONNECTOR_VGA, &lx_connector_vga_funcs, &lx_connector_vga_helper_funcs },
-	[LX_CONNECTOR_LVDS]      = { DRM_MODE_CONNECTOR_LVDS, },
-	[LX_CONNECTOR_COMPANION] = { DRM_MODE_CONNECTOR_Unknown, },
-	[LX_CONNECTOR_VOP]       = { DRM_MODE_CONNECTOR_Unknown, },
+	[LX_CONNECTOR_VGA] = {
+		DRM_MODE_CONNECTOR_VGA,
+		LX_ENCODER_DAC,
+		&lx_connector_vga_funcs,
+		&lx_connector_vga_helper_funcs
+	},
+	[LX_CONNECTOR_LVDS] = {
+		DRM_MODE_CONNECTOR_LVDS,
+		LX_ENCODER_PANEL,
+	},
 };
+
+static struct drm_encoder * lx_connector_best_encoder(
+					struct drm_connector *connector)
+{
+	struct lx_priv *priv = connector->dev->dev_private;
+	struct lx_connector *lx_conn = to_lx_connector(connector);
+	enum lx_encoders encoder_id = lx_connector_types[lx_conn->id].encoder;
+	return &priv->encoders[encoder_id].base;
+}
 
 static struct drm_connector * lx_connector_init(struct drm_device *dev,
 						enum lx_connectors connector_id)
@@ -681,17 +703,41 @@ static struct drm_connector * lx_connector_init(struct drm_device *dev,
 	drm_connector_helper_add(connector,
 				 lx_connector_types[connector_id].hfuncs);
 
-	/* TODO: really setup outputs */
-	connector->interlace_allowed = 0;
-	connector->doublescan_allowed = 0;
+#if 0
+/* TODO: */
+	drm_connector_attach_property(
+			connector,
+			dev->mode_config.scaling_mode_property,
+			DRM_MODE_SCALE_NONE);
+#endif
+
+	switch (connector_id) {
+	case LX_CONNECTOR_VGA:
+		lx_conn->max_width = 1920;
+		lx_conn->max_height = 1440;
+		lx_conn->max_hz = 340000;
+		connector->polled = DRM_CONNECTOR_POLL_CONNECT;
+		/* TODO: shall remember whether last ddc query was successful */
+		if (0 && priv->ddc)
+			connector->polled |= DRM_CONNECTOR_POLL_DISCONNECT;
+		break;
+	case LX_CONNECTOR_LVDS:
+		lx_conn->max_width = 1600;
+		lx_conn->max_height = 1200;
+		lx_conn->max_hz = 162000;
+		break;
+	case LX_CONNECTOR_VOP:
+		lx_conn->max_width = 1920;
+		lx_conn->max_height = 1080;
+		lx_conn->max_hz = 75000;
+		connector->interlace_allowed = 1;
+		connector->doublescan_allowed = 1;
+		break;
+	}
+
+	/* TODO: really setup outputs? */
 	connector->initial_x = 0;
 	connector->initial_y = 0;
-
-	if (connector_id == LX_CONNECTOR_VGA) {
-		connector->polled = DRM_CONNECTOR_POLL_CONNECT;
-		if (priv->ddc)
-			connector->polled |= DRM_CONNECTOR_POLL_DISCONNECT;
-	}
 
 	drm_sysfs_connector_add(connector);
 
@@ -796,12 +842,15 @@ static void lx_encoder_dac_dpms(struct drm_encoder *encoder, int mode) {
 static void lx_encoder_prepare(struct drm_encoder *encoder)
 {
 	struct drm_encoder_helper_funcs *encoder_funcs;
+
 	encoder_funcs = encoder->helper_private;
 	encoder_funcs->dpms(encoder, DRM_MODE_DPMS_OFF);
 }
 
-static void lx_encoder_commit(struct drm_encoder *encoder) {
+static void lx_encoder_commit(struct drm_encoder *encoder)
+{
 	struct drm_encoder_helper_funcs *encoder_funcs;
+
 	encoder_funcs = encoder->helper_private;
 	encoder_funcs->dpms(encoder, DRM_MODE_DPMS_ON);
 }
@@ -821,7 +870,7 @@ static unsigned lx_get_enabled_encoders(struct drm_crtc *crtc) {
 
 	list_for_each_entry(enc, &crtc->dev->mode_config.encoder_list, head) {
 		if (enc->crtc == crtc && to_lx_encoder(enc)->enabled)
-			mask |= BIT_MASK(idx);
+			mask |= 1 << idx;
 		idx++;
 	}
 
@@ -884,9 +933,6 @@ static const struct drm_encoder_helper_funcs lx_encoder_dac_helper_funcs = {
 	void (*save)(struct drm_encoder *encoder);
 	void (*restore)(struct drm_encoder *encoder);
 
-	void (*mode_set)(struct drm_encoder *encoder,
-			 struct drm_display_mode *mode,
-			 struct drm_display_mode *adjusted_mode);
 	struct drm_crtc *(*get_crtc)(struct drm_encoder *encoder);
 	/* disable encoder when not in use - more explicit than dpms off */
 	void (*disable)(struct drm_encoder *encoder);
@@ -904,8 +950,6 @@ static struct {
 } const lx_encoder_types[LX_NUM_ENCODERS] = {
 	[LX_ENCODER_DAC]    = { DRM_MODE_ENCODER_DAC, &lx_encoder_dac_helper_funcs },
 	[LX_ENCODER_PANEL]  = { DRM_MODE_ENCODER_LVDS, },
-	[LX_ENCODER_VOP]    = { DRM_MODE_ENCODER_TVDAC, },
-	[LX_ENCODER_BYPASS] = { DRM_MODE_ENCODER_NONE, },
 };
 
 static struct drm_encoder * lx_encoder_init(struct drm_device *dev,
@@ -1474,7 +1518,7 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 	 * DC_GFX_SCALE, DC_IRQ_FILT_CTL and DC_FILT_COEFF(1|2) */
 
 	/* vscale / hscale, format: fixed 2.14 */
-	write_dc(priv, DC_GFX_SCALE, 0x4000 << 16 | 0x4000);
+	write_dc(priv, DC_GFX_SCALE, 0x3000 << 16 | 0x3000);
 
 	/* trigger line count IRQ when vblank starts (if IRQ is enabled) */
 	/* TODO: graphics/flicker/alpha filter, interlacing */
@@ -1503,19 +1547,21 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 	lo &= ~MSR_VP_GLD_MSR_CONFIG_FPC;
 	lo &= ~MSR_VP_GLD_MSR_CONFIG_FMT_MASK;
 
-	if (encoders == BIT_MASK(LX_ENCODER_DAC))
+	if (encoders == 1 << LX_ENCODER_DAC)
 		lo |= MSR_VP_GLD_MSR_CONFIG_FMT_CRT;
-	else if (encoders & BIT_MASK(LX_ENCODER_PANEL))
+	else if (encoders & (1 << LX_ENCODER_PANEL))
 		lo |= MSR_VP_GLD_MSR_CONFIG_FMT_FP;
-	else if (encoders & BIT_MASK(LX_ENCODER_VOP))
+#if 0
+	else if (encoders & (1 << LX_ENCODER_VOP))
 		lo |= MSR_VP_GLD_MSR_CONFIG_FMT_VOP;
-	else if (encoders == BIT_MASK(LX_ENCODER_BYPASS)) {
+	else if (encoders == 1 << LX_ENCODER_BYPASS) {
 		lo |= MSR_VP_GLD_MSR_CONFIG_FMT_DRGB;
 		/* TODO: set format byte order [7:6] based on drm-property */
 		/* TODO: set interchange UV [14] based on drm-property */
 	}
+#endif
 
-	if (encoders & (BIT_MASK(LX_ENCODER_PANEL) | BIT_MASK(LX_ENCODER_VOP)))
+	if (encoders & (1 << LX_ENCODER_PANEL /*| 1 << LX_ENCODER_VOP*/))
 		lo |= MSR_VP_GLD_MSR_CONFIG_FPC;
 
 	wrmsr(LX_MSR(LX_VP, LX_GLD_MSR_CONFIG), lo, hi);
@@ -1529,15 +1575,15 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 	vcfg = read_vp(priv, VP_DCFG);
 	vcfg &= ~VP_DCFG_GV_GAM; /* select gamma RAM for graphics */
 
-	if ((m->flags & DRM_MODE_FLAG_NHSYNC)) {
-		vcfg &= ~VP_DCFG_CRT_HSYNC_POL;
+	if (!(m->flags & DRM_MODE_FLAG_NHSYNC)) { /* polarity of active edge */
+		vcfg &= ~VP_DCFG_CRT_HSYNC_POL; /* high */
 	} else {
-		vcfg |= VP_DCFG_CRT_HSYNC_POL;
+		vcfg |= VP_DCFG_CRT_HSYNC_POL;  /* low */
 	}
-	if ((m->flags & DRM_MODE_FLAG_NVSYNC)) {
-		vcfg &= ~VP_DCFG_CRT_VSYNC_POL;
+	if (!(m->flags & DRM_MODE_FLAG_NVSYNC)) {
+		vcfg &= ~VP_DCFG_CRT_VSYNC_POL; /* high */
 	} else {
-		vcfg |= VP_DCFG_CRT_VSYNC_POL;
+		vcfg |= VP_DCFG_CRT_VSYNC_POL;  /* low */
 	}
 
 	vcfg |= VP_DCFG_DAC_BL_EN;
@@ -1655,7 +1701,7 @@ static void lx_crtc_init(struct drm_device *dev, enum lx_crtcs crtc_id)
 static void lx_connector_encoder_init(struct drm_device *dev,
 				      enum lx_connectors connector_id)
 {
-	enum lx_encoders encoder_id = connector_best_encoders[connector_id];
+	enum lx_encoders encoder_id = lx_connector_types[connector_id].encoder;
 	struct drm_connector *connector;
 	struct drm_encoder *encoder;
 
@@ -1663,7 +1709,8 @@ static void lx_connector_encoder_init(struct drm_device *dev,
 	/* the encoder may already be initialized... */
 	encoder = lx_encoder_init(dev, encoder_id);
 
-	encoder->possible_crtcs = BIT_MASK(LX_CRTC_GRAPHIC);
+	encoder->possible_crtcs = 1 << LX_CRTC_GRAPHIC | 1 << LX_CRTC_VIDEO;
+	encoder->possible_clones = 1 << LX_ENCODER_DAC;
 
 	drm_mode_connector_attach_encoder(connector, encoder);
 }
@@ -1747,147 +1794,6 @@ static void lx_modeset_cleanup(struct drm_device *dev) {
  *   - alignment: 1 MB (via GP's GLD_MSR_CONFIG)
  */
 
-/* TODO: what's this needed for? */
-#define DRM_FILE_PAGE_OFFSET (0x100000000ULL >> PAGE_SHIFT)
-
-static struct ttm_backend * lx_bo_create_ttm_backend_entry(
-		struct ttm_bo_device *bdev)
-{
-	return NULL;
-}
-
-static int lx_bo_invalidate_caches(struct ttm_bo_device *bdev, uint32_t flags)
-{
-	return 0;
-}
-
-static int lx_bo_init_mem_type(struct ttm_bo_device *bdev, uint32_t type,
-			       struct ttm_mem_type_manager *man)
-{
-	struct lx_mman *mman = container_of(bdev, struct lx_mman, bdev);
-	struct lx_priv *priv = container_of(mman, struct lx_priv, mman);
-
-	switch (type) {
-	case TTM_PL_SYSTEM:
-		/* System memory */
-		man->flags = TTM_MEMTYPE_FLAG_MAPPABLE;
-		man->available_caching = TTM_PL_MASK_CACHING;
-		man->default_caching = TTM_PL_FLAG_CACHED;
-		break;
-	case TTM_PL_VRAM:
-		man->flags = TTM_MEMTYPE_FLAG_FIXED |
-			     TTM_MEMTYPE_FLAG_MAPPABLE;
-		man->available_caching = TTM_PL_FLAG_UNCACHED |
-					 TTM_PL_FLAG_WC;
-		man->default_caching = TTM_PL_FLAG_WC;
-		man->gpu_offset = priv->vmem_phys;
-		man->func = &ttm_bo_manager_func;
-		break;
-	default:
-		DRM_ERROR("Unsupported memory type %u\n", (unsigned)type);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static void
-lx_bo_evict_flags(struct ttm_buffer_object *bo, struct ttm_placement *pl)
-{
-}
-
-static int lx_bo_move(struct ttm_buffer_object *bo, bool evict, bool intr,
-		      bool no_wait_reserve, bool no_wait_gpu,
-		      struct ttm_mem_reg *new_mem)
-{
-	return 0;
-}
-
-static int lx_bo_verify_access(struct ttm_buffer_object *bo, struct file *filp)
-{
-	return 0;
-}
-
-static int lx_ttm_io_mem_reserve(struct ttm_bo_device *bdev,
-				 struct ttm_mem_reg *mem)
-{
-	return 0;
-}
-
-static void lx_ttm_io_mem_free(struct ttm_bo_device *bdev,
-			       struct ttm_mem_reg *mem)
-{
-}
-
-static int lx_ttm_fault_reserve_notify(struct ttm_buffer_object *bo)
-{
-	return 0;
-}
-
-static struct ttm_bo_driver lx_bo_driver = {
-	.create_ttm_backend_entry = lx_bo_create_ttm_backend_entry,
-	.invalidate_caches = lx_bo_invalidate_caches,
-	.init_mem_type = lx_bo_init_mem_type,
-	.evict_flags = lx_bo_evict_flags,
-	.move = lx_bo_move,
-	.verify_access = lx_bo_verify_access,
-	.fault_reserve_notify = lx_ttm_fault_reserve_notify,
-	.io_mem_reserve = lx_ttm_io_mem_reserve,
-	.io_mem_free = lx_ttm_io_mem_free,
-};
-
-static int generic_ttm_mem_global_init(struct drm_global_reference *ref)
-{
-	return ttm_mem_global_init(ref->object);
-}
-
-static void generic_ttm_mem_global_release(struct drm_global_reference *ref)
-{
-	ttm_mem_global_release(ref->object);
-}
-
-static void generic_ttm_global_release(struct lx_mman *ttm)
-{
-	if (ttm->mem_global_ref.release == NULL)
-		return;
-
-	drm_global_item_unref(&ttm->bo_global_ref.ref);
-	drm_global_item_unref(&ttm->mem_global_ref);
-	ttm->mem_global_ref.release = NULL;
-}
-
-static int generic_ttm_global_init(struct lx_mman *ttm) {
-	struct drm_global_reference *global_ref;
-	int r;
-
-	global_ref = &ttm->mem_global_ref;
-	global_ref->global_type = DRM_GLOBAL_TTM_MEM;
-	global_ref->size = sizeof(struct ttm_mem_global);
-	global_ref->init = generic_ttm_mem_global_init;
-	global_ref->release = generic_ttm_mem_global_release;
-	r = drm_global_item_ref(global_ref);
-	if (r != 0) {
-		DRM_ERROR("Failed setting up TTM memory accounting "
-			  "subsystem.\n");
-		return r;
-	}
-
-	ttm->bo_global_ref.mem_glob = ttm->mem_global_ref.object;
-	global_ref = &ttm->bo_global_ref.ref;
-	global_ref->global_type = DRM_GLOBAL_TTM_BO;
-	global_ref->size = sizeof(struct ttm_bo_global);
-	global_ref->init = ttm_bo_global_init;
-	global_ref->release = ttm_bo_global_release;
-	r = drm_global_item_ref(global_ref);
-	if (r != 0) {
-		DRM_ERROR("Failed setting up TTM BO subsystem.\n");
-		drm_global_item_unref(&ttm->mem_global_ref);
-		return r;
-	}
-
-	return 0;
-}
-
 /* copied from lxfb_ops.c */
 static unsigned int lx_vmem_size(void)
 {
@@ -1952,21 +1858,11 @@ static int lx_map_video_memory(struct pci_dev *pdev, struct lx_priv *priv) {
 
 	ret = -ENOMEM;
 
+	
+
 	/* todo: mark this region as write-combined (uncacheable)
 	 * (see LX Processor Data Book, Table 5-17, p. 170) */
-#if 0
-	ret = generic_ttm_global_init(&priv->mman);
 
-	ret = ttm_bo_device_init(&priv->mman.bdev,
-				 priv->mman.bo_global_ref.ref.object,
-				 &lx_bo_driver, DRM_FILE_PAGE_OFFSET,
-				 false); /* TODO: really need dma32? */
-
-	DRM_DEBUG_DRIVER("ttm_bo_init_mm with size %u MB\n", priv->vmem_size >> 20);
-
-	ret = ttm_bo_init_mm(&priv->mman.bdev, TTM_PL_VRAM,
-			     priv->vmem_size >> PAGE_SHIFT);
-#endif
 	/* XXX: rather use pci_iomap? */
 	priv->gp_regs = pci_ioremap_bar(pdev, 1);
 	if (priv->gp_regs == NULL)
@@ -2010,11 +1906,7 @@ static void lx_unmap_video_memory(struct pci_dev *pdev, struct lx_priv *priv) {
 	pci_iounmap(pdev, priv->dc_regs);
 	pci_iounmap(pdev, priv->gp_regs);
 	// iounmap(priv->vmem_virt);
-#if 0
-	ttm_bo_clean_mm(&priv->mman.bdev, TTM_PL_VRAM);
-	ttm_bo_device_release(&priv->mman.bdev);
-	generic_ttm_global_release(&priv->mman);
-#endif
+
 	pci_release_region(pdev, 3);
 	pci_release_region(pdev, 2);
 	pci_release_region(pdev, 1);
