@@ -7,7 +7,7 @@
 #define DRIVER_AUTHOR		"Franz Brauße"
 
 #define DRIVER_NAME		"lx"
-#define DRIVER_DESC		"Geode LX graphics driver"
+#define DRIVER_DESC		"Geode LX KMS"
 #define DRIVER_DATE		"20110906"
 
 #define DRIVER_MAJOR		0
@@ -153,6 +153,8 @@ struct lx_priv {
 	struct lx_connector connectors[LX_NUM_CONNECTORS];
 	struct lx_encoder   encoders[LX_NUM_ENCODERS];
 	struct lx_crtc      crtcs[LX_NUM_CRTCS];
+
+	struct timeval      last_vblank;
 
 	struct lx_fb        *fb;
 

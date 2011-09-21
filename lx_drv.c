@@ -1751,7 +1751,6 @@ static void lx_modeset_init(struct drm_device *dev) {
 	/* Init connectors and their corresponding 'best' encoders */
 	lx_connector_encoder_init(dev, LX_CONNECTOR_VGA);/*
 	lx_connector_init(dev, LX_CONNECTOR_LVDS);
-	lx_connector_init(dev, LX_CONNECTOR_COMPANION);
 	lx_connector_init(dev, LX_CONNECTOR_VOP);*/
 
 	/* Additional, 'non-best' encoders:
@@ -1794,7 +1793,7 @@ static void lx_modeset_cleanup(struct drm_device *dev) {
  *   - alignment: 1 MB (via GP's GLD_MSR_CONFIG)
  */
 
-/* copied from lxfb_ops.c */
+/* from lxfb_ops.c */
 static unsigned int lx_vmem_size(void)
 {
 	unsigned int val;
@@ -1803,6 +1802,7 @@ static unsigned int lx_vmem_size(void)
 		uint32_t hi, lo;
 
 		/* The number of pages is (PMAX - PMIN)+1 */
+		/* TODO: this is not quite right: there are more regs than just RO0 */
 		rdmsr(MSR_GLIU_P2D_RO0, lo, hi);
 
 		/* PMAX */
@@ -1992,22 +1992,53 @@ failed_map_video_memory:
 
 int lx_driver_unload(struct drm_device *dev) {
 	struct lx_priv *priv = dev->dev_private;
+
 	drm_vblank_off(dev, LX_CRTC_GRAPHIC);
 	drm_vblank_cleanup(dev);
-	drm_irq_uninstall(dev);
+
+	if (dev->irq_enabled) {
+		DRV_INFO("disabling previously enabled dev->irqs\n");
+		drm_irq_uninstall(dev);
+	}
+
 	lx_modeset_cleanup(dev);
 	lx_unmap_video_memory(dev->pdev, priv);
+
 	kfree(priv);
+
 	return 0;
 }
 
-/** Gets the current scanline value from the scanout logic.
+/**
+ * Gets the current scanline value from the scanout logic.
+ *
  * @return negative when the value is currently transitioning due to being
- *         unbuffered, a valid vpos otherwise */
-int lx_get_scanout_vpos(struct lx_priv *priv) {
+ *         unbuffered, a valid vpos otherwise
+ */
+static int lx_get_scanout_vpos(struct lx_priv *priv)
+{
 	int v = read_dc(priv, DC_LINE_CNT);
 	int w = read_dc(priv, DC_LINE_CNT);
 	return (v == w) ? v : -1;
+}
+
+static int lx_driver_get_vblank_timestamp(struct drm_device *dev, int crtc,
+					  int *max_error,
+					  struct timeval *vblank_time,
+					  unsigned flags)
+{
+	struct lx_priv *priv = dev->dev_private;
+
+	if (crtc != LX_CRTC_GRAPHIC)
+		return -EINVAL;
+
+	if (flags & DRM_CALLED_FROM_VBLIRQ) {
+		/* the correct timestamp has been saved by our irq-handler */
+		*vblank_time = priv->last_vblank;
+		return 1;
+	}
+
+	return 0;
 }
 
 /**
@@ -2019,35 +2050,42 @@ int lx_get_scanout_vpos(struct lx_priv *priv) {
  * a hardware vblank counter, this routine should be a no-op, since
  * interrupts will have to stay on to keep the count accurate.
  *
- * RETURNS
- * Zero on success, appropriate errno if the given @crtc's vblank
- * interrupt cannot be enabled.
+ * @return  zero on success, appropriate errno if the given @crtc's vblank
+ *          interrupt cannot be enabled.
  */
-static int lx_driver_enable_vblank(struct drm_device *dev, int crtc) {
+static int lx_driver_enable_vblank(struct drm_device *dev, int crtc)
+{
 	struct lx_priv *priv = dev->dev_private;
 	struct drm_display_mode *mode = &priv->crtcs[crtc].base.hwmode;
 	u32 dc_irq_filt_ctl;
 	u32 dc_irq;
+
+	if (crtc != LX_CRTC_GRAPHIC) {
+		DRM_ERROR("lx: tried enabling vblank irq on illegal CRTC: %d\n",
+			  crtc);
+		return -EINVAL;
+	}
 
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
 
 	/* set line counter */
 	dc_irq_filt_ctl = read_dc(priv, DC_IRQ_FILT_CTL);
 	dc_irq_filt_ctl &= ~(((1 << 11) - 1) << 16); /* clear bits [26:16] */
-	/* set IRQ trigger value there */
-	dc_irq_filt_ctl |= (mode->crtc_vblank_start - 100) << 16;
+	/* this is really a scanout line trigger (the "real" vblank interrupt
+	 * the Geode provides is an SMM one, so unaccessible to us), but that
+	 * should fit our needs */
+	dc_irq_filt_ctl |= 0 << 16; /* line 0 of scanout buffer */
 	write_dc(priv, DC_IRQ_FILT_CTL, dc_irq_filt_ctl);
 
 	/* enable line count interrupt */
 	dc_irq = read_dc(priv, DC_IRQ);
-	dc_irq &= ~LX_IRQ_STATUS_MASK; /* don't clear any interrupt status bits */
-	dc_irq &= ~DC_IRQ_MASK; /* unmask line cnt interrupt */
+	dc_irq &= ~LX_IRQ_STATUS_MASK;  /* don't clear any interrupt status bits
+	                                 * by writing back what was read */
+	dc_irq &= ~DC_IRQ_MASK;         /* unmask line cnt interrupt */
 	write_dc(priv, DC_IRQ, dc_irq);
 
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 
-	DRM_DEBUG_DRIVER("crtc: %d, filt: %08x, dc_irq: %08x\n",
-			 crtc, dc_irq_filt_ctl, dc_irq);
 	return 0;
 }
 
@@ -2075,53 +2113,48 @@ static void lx_driver_disable_vblank(struct drm_device *dev, int crtc) {
 	write_dc(priv, DC_IRQ, dc_irq);
 
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
-
-	DRM_DEBUG_DRIVER("crtc: %d, dc_irq: %08x\n", crtc, dc_irq);
 }
-
-/* --------------------------------------------------------------------------
- * Stubs
- * -------------------------------------------------------------------------- */
 
 static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS) {
 	struct drm_device *dev = arg;
 	struct lx_priv *priv = dev->dev_private;
 	irqreturn_t ret = IRQ_NONE;
-	u32 dc_irq, gp_irq;
+	u32 dc_irq, gp_irq = 0;
 
-	 {
-		dc_irq = read_dc(priv, DC_IRQ);
+	dc_irq = read_dc(priv, DC_IRQ);
+#if 0
+	gp_irq = read_gp(priv, GP_INT_CNTRL);
+#endif
 
+	dc_irq &= ~(dc_irq << 16); /* clear all masked interrupts */
+	gp_irq &= ~(gp_irq << 16); /* clear all masked interrupts */
+
+	if (dc_irq & LX_IRQ_STATUS_MASK) {
+		/* some of DC's IRQ status bits seem to be enabled ... */
 		write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
 		write_dc(priv, DC_IRQ, dc_irq); /* clear DC IRQ status */
 		write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 
-		// gp_irq = read_gp(priv, GP_INT_CNTRL);
-/*
-		DRM_DEBUG_DRIVER("IRQ: dc old: %08x, new: %08x\n",
-				 dc_irq, read_dc(priv, DC_IRQ));
-*/
-		dc_irq &= ~(dc_irq << 16); /* clear all masked interrupts */
-		// gp_irq &= ~(gp_irq << 16); /* clear all masked interrupts */
-
 		if (dc_irq & DC_IRQ_STATUS) {
-			DRM_DEBUG_DRIVER("IRQ: vline\n");
+			/* programmed line counter value (0) has been reached */
+			do_gettimeofday(&priv->last_vblank);
 			drm_handle_vblank(dev, LX_CRTC_GRAPHIC);
 			ret = IRQ_HANDLED;
 
 			/* TODO: process any page flips, etc. */
 		}
+	}
 
-/*
+	if (gp_irq & LX_IRQ_STATUS_MASK) {
+		/* some of GP's IRQ status bits seem to be enabled ... */
+		write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
+
 		if (gp_irq & GP_INT_IDLE_STATUS) {
 		}
 		if (gp_irq & GP_INT_CMD_BUF_EMPTY_STATUS) {
 		}
-*/
-		/* clear DC IRQ status */
-		// write_dc(priv, DC_IRQ, DC_IRQ_STATUS | ~LX_IRQ_STATUS_MASK);
-		// write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
 	}
+
 	return ret;
 }
 
@@ -2148,6 +2181,10 @@ static void lx_driver_irq_uninstall(struct drm_device *dev) {
 	DRM_DEBUG_DRIVER("\n");
 	lx_driver_irq_preinstall(dev);
 }
+
+/* --------------------------------------------------------------------------
+ * Stubs
+ * -------------------------------------------------------------------------- */
 
 static int lx_driver_open(struct drm_device *dev, struct drm_file *file) {
 	DRM_DEBUG_DRIVER("\n");
@@ -2193,8 +2230,6 @@ static struct drm_driver driver = {
 	.load			= lx_driver_load,
 	.unload			= lx_driver_unload,
 	.device_is_agp		= lx_driver_device_is_agp,
-
-	/* These need testing ... */
 	.irq_preinstall		= lx_driver_irq_preinstall,
 	.irq_postinstall	= lx_driver_irq_postinstall,
 	.irq_uninstall		= lx_driver_irq_uninstall,
@@ -2202,6 +2237,7 @@ static struct drm_driver driver = {
 	.enable_vblank		= lx_driver_enable_vblank,
 	.disable_vblank		= lx_driver_disable_vblank,
 	.get_vblank_counter	= drm_vblank_count,
+	.get_vblank_timestamp	= lx_driver_get_vblank_timestamp,
 
 	/* These are stubs ... */
 	.open			= lx_driver_open,
