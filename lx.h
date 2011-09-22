@@ -144,10 +144,10 @@ struct lx_priv {
 	resource_size_t vmem_phys; /* physical address for framebuffer & off screen memory */
 	resource_size_t vmem_size;
 	// void __iomem *vmem_virt; /* virtual address for framebuffer & off screen memory */
-	void __iomem *gp_regs; /* graphics processor regs */
-	void __iomem *dc_regs; /* display controller regs */
-	void __iomem *vp_regs; /* video processor regs */
-	
+	drm_local_map_t *gp; /* graphics processor regs */
+	drm_local_map_t *dc; /* display controller regs */
+	drm_local_map_t *vp; /* video processor regs */
+
 	struct i2c_adapter *ddc;
 
 	struct lx_connector connectors[LX_NUM_CONNECTORS];
@@ -604,52 +604,52 @@ enum vop_registers {
 
 static inline uint32_t read_gp(struct lx_priv *priv, int reg)
 {
-	return readl(priv->gp_regs + 4*reg);
+	return DRM_READ32(priv->gp, 4 * reg);
 }
 
 static inline void write_gp(struct lx_priv *priv, int reg, uint32_t val)
 {
-	writel(val, priv->gp_regs + 4*reg);
+	DRM_WRITE32(priv->gp, 4 * reg, val);
 }
 
 static inline uint32_t read_dc(struct lx_priv *priv, int reg)
 {
-	return readl(priv->dc_regs + 4*reg);
+	return DRM_READ32(priv->dc, 4 * reg);
 }
 
 static inline void write_dc(struct lx_priv *priv, int reg, uint32_t val)
 {
-	writel(val, priv->dc_regs + 4*reg);
+	DRM_WRITE32(priv->dc, 4 * reg, val);
 }
 
 static inline uint32_t read_vp(struct lx_priv *priv, int reg)
 {
-	return readl(priv->vp_regs + 8*reg);
+	return DRM_READ32(priv->vp, 8 * reg);
 }
 
 static inline void write_vp(struct lx_priv *priv, int reg, uint32_t val)
 {
-	writel(val, priv->vp_regs + 8*reg);
+	DRM_WRITE32(priv->vp, 8 * reg, val);
 }
 
 static inline uint32_t read_fp(struct lx_priv *priv, int reg)
 {
-	return readl(priv->vp_regs + 8*reg + VP_FP_START);
+	return DRM_READ32(priv->vp, 8 * reg + VP_FP_START);
 }
 
 static inline void write_fp(struct lx_priv *priv, int reg, uint32_t val)
 {
-	writel(val, priv->vp_regs + 8*reg + VP_FP_START);
+	DRM_WRITE32(priv->vp, 8 * reg + VP_FP_START, val);
 }
 
 static inline uint32_t read_vop(struct lx_priv *priv, int reg)
 {
-	return readl(priv->vp_regs + 8*reg + VP_VOP_START);
+	return DRM_READ32(priv->vp, 8 * reg + VP_VOP_START);
 }
 
 static inline void write_vop(struct lx_priv *priv, int reg, uint32_t val)
 {
-	writel(val, priv->vp_regs + 8*reg + VP_VOP_START);
+	DRM_WRITE32(priv->vp, 8 * reg + VP_VOP_START, val);
 }
 
 #endif

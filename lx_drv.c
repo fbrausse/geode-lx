@@ -1646,15 +1646,15 @@ static void lx_crtc_load_lut(struct drm_crtc *crtc)
 }
 
 static const struct drm_crtc_helper_funcs lx_crtc_helper_funcs = {
-	.dpms = lx_crtc_dpms, /* if (ON) update_scanout; commit */
-	.mode_fixup = lx_crtc_mode_fixup, /* return 1 */
-	.mode_set = lx_crtc_mode_set, /* update (omap_)crtc->info w/ adjusted_mode && update_scanout */
-	.prepare = lx_crtc_prepare, /* .dpms(DRM_MODE_DPMS_OFF) */
-	.commit = lx_crtc_commit, /* .dpms(DRM_MODE_DPMS_ON) */
-	.mode_set_base = lx_crtc_mode_set_base, /* update_scanout; commit */
-	.load_lut = lx_crtc_load_lut,
+	.dpms		= lx_crtc_dpms, /* if (ON) update_scanout; commit */
+	.mode_fixup	= lx_crtc_mode_fixup, /* return 1 */
+	.mode_set	= lx_crtc_mode_set, /* update (omap_)crtc->info w/ adjusted_mode && update_scanout */
+	.prepare	= lx_crtc_prepare,
+	.commit		= lx_crtc_commit,
+	.mode_set_base	= lx_crtc_mode_set_base,
+	.load_lut	= lx_crtc_load_lut,
 #if 0
-	.disable = NULL, /* more explicit than dpms */
+	.disable, /* more explicit than dpms */
 	int (*mode_set_base_atomic)(struct drm_crtc *crtc,
 				    struct drm_framebuffer *fb, int x, int y,
 				    enum mode_set_atomic);
@@ -1847,7 +1847,7 @@ static unsigned int lx_vmem_size(void)
 	return (val << 20);
 }
 
-static int lx_map_video_memory(struct pci_dev *pdev, struct lx_priv *priv) {
+static int lx_map_video_memory(struct drm_device *dev) {
 	static const char *region_names[] = {
 		"lx-vram", /* shared video memory set aside by the bios */
 		"lx-gp", /* graphics processor MSRs */
@@ -1855,6 +1855,8 @@ static int lx_map_video_memory(struct pci_dev *pdev, struct lx_priv *priv) {
 		"lx-vp", /* video processor MSRs */
 		/* the unused BAR 4 points to MSRs for the video input port */
 	};
+	struct pci_dev *pdev = dev->pdev;
+	struct lx_priv *priv = dev->dev_private;
 	unsigned i;
 	int ret;
 /*
@@ -1882,17 +1884,22 @@ static int lx_map_video_memory(struct pci_dev *pdev, struct lx_priv *priv) {
 	/* todo: mark this region as write-combined (uncacheable)
 	 * (see LX Processor Data Book, Table 5-17, p. 170) */
 
-	/* XXX: rather use pci_iomap? */
-	priv->gp_regs = pci_ioremap_bar(pdev, 1);
-	if (priv->gp_regs == NULL)
+	ret = drm_addmap(dev,
+		   pci_resource_start(pdev, 1), pci_resource_len(pdev, 1),
+		   _DRM_REGISTERS, _DRM_READ_ONLY | _DRM_DRIVER, &priv->gp);
+	if (ret)
 		goto failed_map_gp;
 
-	priv->dc_regs = pci_ioremap_bar(pdev, 2);
-	if (priv->dc_regs == NULL)
+	ret = drm_addmap(dev,
+		   pci_resource_start(pdev, 2), pci_resource_len(pdev, 2),
+		   _DRM_REGISTERS, _DRM_READ_ONLY | _DRM_DRIVER, &priv->dc);
+	if (ret)
 		goto failed_map_dc;
 
-	priv->vp_regs = pci_ioremap_bar(pdev, 3);
-	if (priv->vp_regs == NULL)
+	ret = drm_addmap(dev,
+		   pci_resource_start(pdev, 3), pci_resource_len(pdev, 3),
+		   _DRM_REGISTERS, _DRM_READ_ONLY | _DRM_DRIVER, &priv->vp);
+	if (ret)
 		goto failed_map_vp;
 
 	/* need to unlock the MSRs for WR with a magic value */
@@ -1908,9 +1915,9 @@ static int lx_map_video_memory(struct pci_dev *pdev, struct lx_priv *priv) {
 	return 0;
 
 failed_map_vp:
-	pci_iounmap(pdev, priv->dc_regs);
+	drm_rmmap(dev, priv->dc);
 failed_map_dc:
-	pci_iounmap(pdev, priv->gp_regs);
+	drm_rmmap(dev, priv->gp);
 failed_map_gp:
 	i = ARRAY_SIZE(region_names);
 failed_req:
@@ -1920,10 +1927,13 @@ failed_req:
 	return ret;
 }
 
-static void lx_unmap_video_memory(struct pci_dev *pdev, struct lx_priv *priv) {
-	pci_iounmap(pdev, priv->vp_regs);
-	pci_iounmap(pdev, priv->dc_regs);
-	pci_iounmap(pdev, priv->gp_regs);
+static void lx_unmap_video_memory(struct drm_device *dev) {
+	struct pci_dev *pdev = dev->pdev;
+	struct lx_priv *priv = dev->dev_private;
+
+	drm_rmmap(dev, priv->vp);
+	drm_rmmap(dev, priv->dc);
+	drm_rmmap(dev, priv->gp);
 	// iounmap(priv->vmem_virt);
 
 	pci_release_region(pdev, 3);
@@ -1954,7 +1964,7 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags) {
 
 	dev->dev_private = priv;
 
-	ret = lx_map_video_memory(dev->pdev, priv);
+	ret = lx_map_video_memory(dev);
 	if (ret) {
 		DRV_ERR("failed mapping video memory or controller registers\n");
 		goto failed_map_video_memory;
@@ -2024,7 +2034,7 @@ static int lx_driver_unload(struct drm_device *dev)
 	}
 
 	lx_modeset_cleanup(dev);
-	lx_unmap_video_memory(dev->pdev, priv);
+	lx_unmap_video_memory(dev);
 
 	kfree(priv);
 
