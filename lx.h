@@ -177,14 +177,23 @@ extern void lx_ddc_cleanup(struct drm_device *dev);
 #define LX_MODE_MAX_VFREQ		100    /* in Hz */
 #define LX_MODE_FREQ_TOL		4000   /* in kHz */
 
-#define LX_MODE_PFLAG_DOTPLL_MASK	0x17fff /* private_flags */
+/* used for drm_display_mode's private_flags */
+#define LX_MODE_PFLAG_DOTPLL_MASK	0x17fff
 
 
+/* The IRQ registers of the LX are 32 bits wide, the upper half of which are
+ * status bits (1: interrupt requested; writing 1 clears status bit, 0 does
+ * nothing) and the lower half are the corresponding mask-bits (1: IRQ disabled,
+ * though the status flag still may be enabled but no IRQ will be triggered). */
+#define LX_IRQ_STATUS_MASK		0xffff0000
+
+/* These form the upper six bytes of the MSR address for the respective
+ * component for outgoing r/w requests from the CPU core */
 #define LX_MC				0x20 /* memory controller */
 #define LX_GLCP				0x4c /* GeodeLink control processor */
 #define LX_VP				0x48 /* video processor */
 #define LX_GP				0xa0 /* graphics processor */
-#define LX_MSR(gldev, adr)		(gldev << 24 | adr)
+#define LX_MSR(gldev, adr)		((gldev) << 24 | (adr & 0xffff))
 
 /* addresses for all GeodeLink devices */
 #define LX_GLD_MSR_CAP			0x2000
@@ -292,8 +301,6 @@ enum gp_registers {
 #define GP_INT_CMD_BUF_EMPTY_STATUS	(1 << 16)
 #define GP_INT_IDLE_MASK		(1 << 1)
 #define GP_INT_CMD_BUF_EMPTY_MASK	(1 << 0)
-
-#define LX_IRQ_STATUS_MASK		0xffff0000
 
 /* Display Controller registers (table 6-47 from the data book) */
 enum dc_registers {
@@ -566,6 +573,9 @@ enum fp_registers {
 
 	FP_DMD,
 	FP_CRC, /* 0x458 */
+
+	FP_RSVD_5,
+	FP_CRC32, /* 0x468 */
 };
 
 #define FP_PT2_HSP			(1 << 22)
@@ -579,6 +589,15 @@ enum fp_registers {
 #define FP_PM_PANEL_ON			(1 << 0)	/* r/o */
 
 #define FP_DFC_BC			((1 << 4) | (1 << 5) | (1 << 6))
+
+
+/* also in VP register space, starting at address 0x800 */
+#define VP_VOP_START	0x800
+
+enum vop_registers {
+	VOP_CONFIG = 0,
+	VOP_SIG
+};
 
 
 /* register access functions */
@@ -612,16 +631,25 @@ static inline void write_vp(struct lx_priv *priv, int reg, uint32_t val)
 {
 	writel(val, priv->vp_regs + 8*reg);
 }
-#if 0
-static inline uint32_t read_fp(struct lxfb_par *priv, int reg)
+
+static inline uint32_t read_fp(struct lx_priv *priv, int reg)
 {
 	return readl(priv->vp_regs + 8*reg + VP_FP_START);
 }
 
-static inline void write_fp(struct lxfb_par *priv, int reg, uint32_t val)
+static inline void write_fp(struct lx_priv *priv, int reg, uint32_t val)
 {
 	writel(val, priv->vp_regs + 8*reg + VP_FP_START);
 }
-#endif
+
+static inline uint32_t read_vop(struct lx_priv *priv, int reg)
+{
+	return readl(priv->vp_regs + 8*reg + VP_VOP_START);
+}
+
+static inline void write_vop(struct lx_priv *priv, int reg, uint32_t val)
+{
+	writel(val, priv->vp_regs + 8*reg + VP_VOP_START);
+}
 
 #endif

@@ -1408,8 +1408,10 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	/* TODO: video downscaling */
 
 	/* DV-RAM Control */
-	/* Linear memory address is always aligned to 4096 */
-	dvctl = priv->vmem_phys;
+	/* ALIGN shouldn't be necessary as the linear memory address is always
+	 * aligned to PAGE_SIZE >= 4096, but it's not like mode-setting were
+	 * critical wrt speed */
+	dvctl = ALIGN(priv->vmem_phys, 4096);
 
 	if (fb->width < 1024) {
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_1K;
@@ -1673,6 +1675,7 @@ static void lx_crtc_init(struct drm_device *dev, enum lx_crtcs crtc_id)
 
 	crtc->enabled = 1;
 	drm_crtc_init(dev, crtc, &lx_crtc_funcs);
+
 	if (drm_mode_crtc_set_gamma_size(crtc, 256)) {
 		struct lx_rgb *en;
 		/* init our backing store for gamma values */
@@ -1691,6 +1694,8 @@ static void lx_crtc_init(struct drm_device *dev, enum lx_crtcs crtc_id)
 		en->r = en->g = en->b = 0xff;
 		en = lx_crtc->lut + LX_LUT_ICON_BORDER;
 		en->r = en->g = en->b = 0x00;
+	} else {
+		DRV_INFO("unable to create backing store for gamma values\n");
 	}
 
 	drm_crtc_helper_add(crtc, &lx_crtc_helper_funcs);
@@ -1698,21 +1703,37 @@ static void lx_crtc_init(struct drm_device *dev, enum lx_crtcs crtc_id)
 
 /* ========================================================================== */
 
-static void lx_connector_encoder_init(struct drm_device *dev,
-				      enum lx_connectors connector_id)
+static int lx_connector_encoder_init(struct drm_device *dev,
+				     enum lx_connectors connector_id)
 {
 	enum lx_encoders encoder_id = lx_connector_types[connector_id].encoder;
 	struct drm_connector *connector;
 	struct drm_encoder *encoder;
+	int ret;
 
 	connector = lx_connector_init(dev, connector_id);
+
 	/* the encoder may already be initialized... */
 	encoder = lx_encoder_init(dev, encoder_id);
 
 	encoder->possible_crtcs = 1 << LX_CRTC_GRAPHIC | 1 << LX_CRTC_VIDEO;
-	encoder->possible_clones = 1 << LX_ENCODER_DAC;
+	if (encoder_id != LX_ENCODER_DAC)
+		encoder->possible_clones = 1 << LX_ENCODER_DAC;
 
-	drm_mode_connector_attach_encoder(connector, encoder);
+	ret = drm_mode_connector_attach_encoder(connector, encoder);
+	if (ret) {
+		DRM_ERROR("failed to attach encoder %s to %s\n",
+			  drm_get_encoder_name(encoder),
+			  drm_get_connector_name(connector));
+		goto out;
+	}
+
+	return 0;
+
+out:
+	encoder->funcs->destroy(encoder);
+	connector->funcs->destroy(connector);
+	return ret;
 }
 
 static void lx_modeset_init(struct drm_device *dev) {
@@ -1737,7 +1758,7 @@ static void lx_modeset_init(struct drm_device *dev) {
 
 	/* TODO: create & attach drm_device specific drm props */
 
-	/* init the ids to an invalid number, so one-time initialization may
+	/* init the ids to an invalid number, so singleton initialization may
 	 * proceed */
 	for (i=0; i<LX_NUM_CONNECTORS; i++)
 		priv->connectors[i].id = LX_NUM_CONNECTORS;
@@ -1749,7 +1770,7 @@ static void lx_modeset_init(struct drm_device *dev) {
 	lx_crtc_init(dev, LX_CRTC_GRAPHIC);
 
 	/* Init connectors and their corresponding 'best' encoders */
-	lx_connector_encoder_init(dev, LX_CONNECTOR_VGA);/*
+	ret = lx_connector_encoder_init(dev, LX_CONNECTOR_VGA);/*
 	lx_connector_init(dev, LX_CONNECTOR_LVDS);
 	lx_connector_init(dev, LX_CONNECTOR_VOP);*/
 
@@ -1761,7 +1782,7 @@ static void lx_modeset_init(struct drm_device *dev) {
 
 	/* TODO: create & attach connector/encoder specific drm props */
 
-	lx_fbdev_init(dev);
+	ret = lx_fbdev_init(dev);
 
 	drm_kms_helper_poll_init(dev);
 }
@@ -1858,8 +1879,6 @@ static int lx_map_video_memory(struct pci_dev *pdev, struct lx_priv *priv) {
 
 	ret = -ENOMEM;
 
-	
-
 	/* todo: mark this region as write-combined (uncacheable)
 	 * (see LX Processor Data Book, Table 5-17, p. 170) */
 
@@ -1897,7 +1916,7 @@ failed_map_gp:
 failed_req:
 	while (i--)
 		pci_release_region(pdev, i);
-	pci_disable_device(pdev);
+	// pci_disable_device(pdev);
 	return ret;
 }
 
@@ -1990,15 +2009,18 @@ failed_map_video_memory:
 	return ret;
 }
 
-int lx_driver_unload(struct drm_device *dev) {
+static int lx_driver_unload(struct drm_device *dev)
+{
 	struct lx_priv *priv = dev->dev_private;
+	int ret = 0;
 
 	drm_vblank_off(dev, LX_CRTC_GRAPHIC);
 	drm_vblank_cleanup(dev);
 
 	if (dev->irq_enabled) {
-		DRV_INFO("disabling previously enabled dev->irqs\n");
-		drm_irq_uninstall(dev);
+		ret = drm_irq_uninstall(dev);
+		if (ret)
+			DRV_INFO("failed uninstalling IRQs: %d\n", ret);
 	}
 
 	lx_modeset_cleanup(dev);
@@ -2006,7 +2028,7 @@ int lx_driver_unload(struct drm_device *dev) {
 
 	kfree(priv);
 
-	return 0;
+	return ret;
 }
 
 /**
@@ -2019,9 +2041,15 @@ static int lx_get_scanout_vpos(struct lx_priv *priv)
 {
 	int v = read_dc(priv, DC_LINE_CNT);
 	int w = read_dc(priv, DC_LINE_CNT);
-	return (v == w) ? v : -1;
+	return (v == w) ? v : -EAGAIN;
 }
 
+/**
+ * \returns
+ * Zero if timestamping isn't supported in current display mode or a
+ * negative number on failure. A positive status code on success,
+ * which describes how the vblank_time timestamp was computed.
+ */
 static int lx_driver_get_vblank_timestamp(struct drm_device *dev, int crtc,
 					  int *max_error,
 					  struct timeval *vblank_time,
@@ -2056,7 +2084,6 @@ static int lx_driver_get_vblank_timestamp(struct drm_device *dev, int crtc,
 static int lx_driver_enable_vblank(struct drm_device *dev, int crtc)
 {
 	struct lx_priv *priv = dev->dev_private;
-	struct drm_display_mode *mode = &priv->crtcs[crtc].base.hwmode;
 	u32 dc_irq_filt_ctl;
 	u32 dc_irq;
 
@@ -2102,7 +2129,7 @@ static void lx_driver_disable_vblank(struct drm_device *dev, int crtc) {
 	struct lx_priv *priv = dev->dev_private;
 	u32 dc_irq;
 
-	if (crtc < 0 || crtc >= LX_NUM_CRTCS)
+	if (crtc != LX_CRTC_GRAPHIC)
 		return;
 
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
@@ -2121,38 +2148,47 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS) {
 	irqreturn_t ret = IRQ_NONE;
 	u32 dc_irq, gp_irq = 0;
 
-	dc_irq = read_dc(priv, DC_IRQ);
+	/* this should be protected by disabled IRQs */
+	{
+		dc_irq = read_dc(priv, DC_IRQ);
 #if 0
-	gp_irq = read_gp(priv, GP_INT_CNTRL);
+		gp_irq = read_gp(priv, GP_INT_CNTRL);
 #endif
 
-	dc_irq &= ~(dc_irq << 16); /* clear all masked interrupts */
-	gp_irq &= ~(gp_irq << 16); /* clear all masked interrupts */
+		dc_irq &= ~(dc_irq << 16); /* clear all masked interrupts */
+		gp_irq &= ~(gp_irq << 16); /* clear all masked interrupts */
 
-	if (dc_irq & LX_IRQ_STATUS_MASK) {
-		/* some of DC's IRQ status bits seem to be enabled ... */
-		write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
-		write_dc(priv, DC_IRQ, dc_irq); /* clear DC IRQ status */
-		write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+		if (dc_irq & LX_IRQ_STATUS_MASK) {
+			/* some of DC's IRQ status bits seem to be enabled ... */
+			write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+			write_dc(priv, DC_IRQ, dc_irq); /* clear DC IRQ status */
+			write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+		}
 
-		if (dc_irq & DC_IRQ_STATUS) {
-			/* programmed line counter value (0) has been reached */
-			do_gettimeofday(&priv->last_vblank);
-			drm_handle_vblank(dev, LX_CRTC_GRAPHIC);
-			ret = IRQ_HANDLED;
-
-			/* TODO: process any page flips, etc. */
+		if (gp_irq & LX_IRQ_STATUS_MASK) {
+			/* some of GP's IRQ status bits seem to be enabled ... */
+			write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
 		}
 	}
 
-	if (gp_irq & LX_IRQ_STATUS_MASK) {
-		/* some of GP's IRQ status bits seem to be enabled ... */
-		write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
 
-		if (gp_irq & GP_INT_IDLE_STATUS) {
-		}
-		if (gp_irq & GP_INT_CMD_BUF_EMPTY_STATUS) {
-		}
+	if (dc_irq & DC_IRQ_STATUS) {
+		/* programmed line counter value (0) has been reached */
+		do_gettimeofday(&priv->last_vblank);
+		drm_handle_vblank(dev, LX_CRTC_GRAPHIC);
+		ret = IRQ_HANDLED;
+
+		/* TODO: process any page flips, etc. */
+	}
+	if (dc_irq & DC_IRQ_VIP_VSYNC_IRQ_STATUS) {
+		ret = IRQ_HANDLED;
+	}
+
+	if (gp_irq & GP_INT_IDLE_STATUS) {
+		ret = IRQ_HANDLED;
+	}
+	if (gp_irq & GP_INT_CMD_BUF_EMPTY_STATUS) {
+		ret = IRQ_HANDLED;
 	}
 
 	return ret;
@@ -2172,7 +2208,7 @@ static void lx_driver_irq_preinstall(struct drm_device *dev) {
 
 static int lx_driver_irq_postinstall(struct drm_device *dev) {
 	DRM_DEBUG_DRIVER("\n");
-	/* TODO: enable interrupts */
+	/* TODO: enable interrupts: vblank */
 
 	return 0;
 }
@@ -2294,7 +2330,6 @@ static struct pci_driver lx_pci_driver = {
 };
 
 static int __init lx_init(void) {
-	// driver.num_ioctls = lx_max_ioctl;
 	return drm_pci_init(&driver, &lx_pci_driver);
 }
 
