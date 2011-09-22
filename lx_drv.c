@@ -220,6 +220,24 @@ static void lx_user_fb_destroy(struct drm_framebuffer *fb) {
 static struct drm_framebuffer_funcs lx_fb_funcs = {
 	.create_handle = lx_user_fb_create_handle,
 	.destroy = lx_user_fb_destroy,
+#if 0
+	/**
+	 * Optinal callback for the dirty fb ioctl.
+	 *
+	 * Userspace can notify the driver via this callback
+	 * that a area of the framebuffer has changed and should
+	 * be flushed to the display hardware.
+	 *
+	 * See documentation in drm_mode.h for the struct
+	 * drm_mode_fb_dirty_cmd for more information as all
+	 * the semantics and arguments have a one to one mapping
+	 * on this function.
+	 */
+	int (*dirty)(struct drm_framebuffer *framebuffer,
+		     struct drm_file *file_priv, unsigned flags,
+		     unsigned color, struct drm_clip_rect *clips,
+		     unsigned num_clips);
+#endif
 };
 
 static int lx_fb_init(struct lx_priv *priv, struct lx_fb *lfb,
@@ -2269,6 +2287,30 @@ static void lx_driver_postclose(struct drm_device *dev, struct drm_file *file)
 static struct drm_ioctl_desc lx_ioctls[] = {
 };
 
+static int lx_driver_dumb_create(struct drm_file *file_priv,
+				 struct drm_device *dev,
+				 struct drm_mode_create_dumb *args)
+{
+	DRM_DEBUG_DRIVER("%ux%u-%u, flags: %x\n",
+			 args->width, args->height, args->bpp, args->flags);
+	return 0;
+}
+
+static int lx_driver_dumb_map_offset(struct drm_file *file_priv,
+				     struct drm_device *dev, uint32_t handle,
+				     uint64_t *offset)
+{
+	DRM_DEBUG_DRIVER("handle: %u\n", handle);
+	return 0;
+}
+
+static int lx_driver_dumb_destroy(struct drm_file *file_priv,
+				  struct drm_device *dev, uint32_t handle)
+{
+	DRM_DEBUG_DRIVER("handle: %u\n", handle);
+	return 0;
+}
+
 static struct drm_driver driver = {
 	.driver_features	= DRIVER_HAVE_IRQ | DRIVER_IRQ_SHARED |
 				  DRIVER_MODESET,
@@ -2292,6 +2334,10 @@ static struct drm_driver driver = {
 	.postclose		= lx_driver_postclose,
 	.ioctls			= lx_ioctls,
 	.num_ioctls		= ARRAY_SIZE(lx_ioctls),
+
+	.dumb_create		= lx_driver_dumb_create,
+	.dumb_map_offset	= lx_driver_dumb_map_offset,
+	.dumb_destroy		= lx_driver_dumb_destroy,
 #if 0
 	.reclaim_buffers	= drm_core_reclaim_buffers,
 	.get_scanout_position   = lx_driver_get_scanout_position,

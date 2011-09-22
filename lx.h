@@ -154,10 +154,12 @@ struct lx_priv {
 	struct lx_encoder   encoders[LX_NUM_ENCODERS];
 	struct lx_crtc      crtcs[LX_NUM_CRTCS];
 
+	/* used by irq-handler and get_vblank_timestamp:
+	 * temporary to keep the vblank timestamps as accurate as possible */
 	struct timeval      last_vblank;
 
+	/* singleton fbdev */
 	struct lx_fb        *fb;
-
 	unsigned pan_x, pan_y;
 
 	struct lx_mman {
@@ -185,7 +187,8 @@ extern void lx_ddc_cleanup(struct drm_device *dev);
  * status bits (1: interrupt requested; writing 1 clears status bit, 0 does
  * nothing) and the lower half are the corresponding mask-bits (1: IRQ disabled,
  * though the status flag still may be enabled but no IRQ will be triggered). */
-#define LX_IRQ_STATUS_MASK		0xffff0000
+#define LX_IRQ_STATUS_SHIFT		16
+#define LX_IRQ_STATUS_MASK		(~0U << LX_IRQ_STATUS_SHIFT)
 
 /* These form the upper six bytes of the MSR address for the respective
  * component for outgoing r/w requests from the CPU core */
@@ -443,7 +446,6 @@ enum dc_registers {
 # define DC_IRQ_VIP_VSYNC_IRQ_STATUS	(1 << 17)
 # define DC_IRQ_STATUS			(1 << 16)
 #endif
-
 #define DC_IRQ_VIP_VSYNC_IRQ_MASK	(1 << 1)
 #define DC_IRQ_MASK			(1 << 0)
 
@@ -533,8 +535,8 @@ enum vp_registers {
 #define VP_DCFG_GV_GAM			(1 << 21)
 #define VP_DCFG_PWR_SEQ_DELAY		((1 << 17) | (1 << 18) | (1 << 19))
 #define VP_DCFG_PWR_SEQ_DELAY_DEFAULT	(1 << 19)	/* undocumented */
-#define VP_DCFG_CRT_SYNC_SKW		((1 << 14) | (1 << 15) | (1 << 16))
-#define VP_DCFG_CRT_SYNC_SKW_DEFAULT	(1 << 16)
+#define VP_DCFG_CRT_SYNC_SKW_MASK	(7 << 14)
+#define VP_DCFG_CRT_SYNC_SKW_DEFAULT	(4 << 14)
 #define VP_DCFG_CRT_VSYNC_POL		(1 << 9)
 #define VP_DCFG_CRT_HSYNC_POL		(1 << 8)
 #define VP_DCFG_DAC_BL_EN		(1 << 3)
