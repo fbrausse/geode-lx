@@ -76,6 +76,15 @@ enum lx_crtcs {
 };
 
 
+struct lx_bo {
+	struct drm_mm_node *node;
+	drm_local_map_t *map; /* for drm_mmap */
+	unsigned width;
+	unsigned height;
+	unsigned bpp;
+	unsigned pitch;
+	int id;
+};
 
 #define to_lx_connector(connector)	\
 		container_of(connector, struct lx_connector, base)
@@ -124,6 +133,8 @@ struct lx_crtc {
 		u8 g;
 		u8 r;
 	} lut[LX_LUT_SIZE];
+
+	struct lx_bo *cursor_bo;
 };
 
 struct lx_priv;
@@ -134,16 +145,17 @@ struct lx_fb {
 	struct drm_framebuffer base;
 	struct drm_fb_helper helper;
 	struct lx_priv *priv;
-	struct ttm_buffer_object *bo;
+	struct lx_bo *bo;
 };
 
 struct lx_priv {
 	struct drm_device *ddev;
 	struct pci_dev *pdev;
 
-	resource_size_t vmem_phys; /* physical address for framebuffer & off screen memory */
+	resource_size_t vmem_phys; /* linear address for framebuffer & off screen memory */
 	resource_size_t vmem_size;
 	// void __iomem *vmem_virt; /* virtual address for framebuffer & off screen memory */
+	// drm_local_map_t *vmem;
 	drm_local_map_t *gp; /* graphics processor regs */
 	drm_local_map_t *dc; /* display controller regs */
 	drm_local_map_t *vp; /* video processor regs */
@@ -166,6 +178,8 @@ struct lx_priv {
 		struct drm_global_reference mem_global_ref;
 		struct ttm_bo_global_ref bo_global_ref;
 		struct ttm_bo_device bdev;
+
+		struct drm_mm mm;
 	} mman;
 };
 
