@@ -135,6 +135,8 @@ struct lx_crtc {
 	} lut[LX_LUT_SIZE];
 
 	struct lx_bo *cursor_bo;
+
+	unsigned flip_pending : 1;
 };
 
 struct lx_priv;

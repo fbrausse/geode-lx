@@ -68,7 +68,7 @@ static struct {
 	{ 0x5303,  97520 }, /*   6, 49,  4 */
 	{ 0x2183, 100187 }, /*   3, 25,  4 */
 	{ 0x2122, 101420 }, /*   3, 19,  3 */
-	{ 0x41B1, 106500 }, /*   5, 28,  2 */
+	// { 0x41B1, 106500 }, /*   5, 28,  2 */ /* TODO: wrong, 134.4 MHz */
 	{ 0x1081, 108000 }, /*   2,  9,  2 */
 	{ 0x6201, 113310 }, /*   7, 33,  2 */
 	{ 0x0041, 119650 }, /*   1,  5,  2 */
@@ -1255,6 +1255,7 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	struct lx_fb *lfb = to_lx_fb(fb);
 	struct lx_fb *lfb2 = to_lx_fb(crtc->fb);
 	unsigned long flags;
+	unsigned offset;
 	int ret;
 
 	DRM_DEBUG_DRIVER("pipe: %d, old fb: %p, bo @ %lx, size: %lu; new fb: %p, bo @ %lx, size: %lu\n",
@@ -1267,11 +1268,12 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 
 	/* Abuse the event_lock for protecting the event */
 	spin_lock_irqsave(&priv->ddev->event_lock, flags);
-	if (lx_crtc->event) {
+	if (lx_crtc->flip_pending) {
 		spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 		return -EBUSY;
 	}
 	lx_crtc->event = event;
+	lx_crtc->flip_pending = 1;
 	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 
 	crtc->fb = fb;
@@ -1281,46 +1283,41 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 		DRM_ERROR("failed to get vblank event before page flip: %d\n", ret);
 		lx_crtc->event = NULL;
 	}
-	DRM_DEBUG_DRIVER("vblank enabled: %d, vblank refcnt: %d\n",
-			 priv->ddev->vblank_enabled[0],
-			 priv->ddev->vblank_refcount[0].counter);
-
-	return ret;
-}
-
-/* called from our IRQ handler to process a pending page-flip */
-static void lx_crtc_do_page_flip(struct drm_crtc *crtc) {
-	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
-	struct lx_priv *priv = crtc->dev->dev_private;
-	struct drm_framebuffer *fb = crtc->fb;
-	struct lx_fb *lfb = to_lx_fb(fb);
-	struct drm_pending_vblank_event *e;
-	unsigned offset;
-	unsigned long flags;
-
-	spin_lock_irqsave(&priv->ddev->event_lock, flags);
-	e = lx_crtc->event;
-	/* TODO: make page-flip work w/o user-event as well */
-	if (!e) {
-		spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
-		return;
-	}
-	lx_crtc->event = NULL;
 
 	offset = (lfb->bo) ? lfb->bo->node->start : 0;
 	offset += crtc->y * fb->pitch + crtc->x * ALIGN(fb->bits_per_pixel, 8) / 8;
 
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	/* The value programmed takes effect at the next frame scan */
 	write_dc(priv, DC_FB_ST_OFFSET, offset);
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 
-	/* wakeup userspace */
-	e->event.sequence = drm_vblank_count(priv->ddev, lx_crtc->id);
-	e->event.tv_sec = priv->last_vblank.tv_sec;
-	e->event.tv_usec = priv->last_vblank.tv_usec;
-	list_add_tail(&e->base.link, &e->base.file_priv->event_list);
-	wake_up_interruptible(&e->base.file_priv->event_wait);
+	return ret;
+}
 
+/* called from our IRQ handler to deliver a pending page-flip event */
+static void lx_crtc_do_page_flip(struct drm_crtc *crtc) {
+	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
+	struct lx_priv *priv = crtc->dev->dev_private;
+	struct drm_pending_vblank_event *e;
+	unsigned long flags;
+
+	spin_lock_irqsave(&priv->ddev->event_lock, flags);
+	if (!lx_crtc->flip_pending) {
+		spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
+		return;
+	}
+	e = lx_crtc->event;
+	lx_crtc->event = NULL;
+	lx_crtc->flip_pending = 0;
+	if (e) {
+		/* wakeup userspace */
+		e->event.sequence = drm_vblank_count(priv->ddev, lx_crtc->id);
+		e->event.tv_sec = priv->last_vblank.tv_sec;
+		e->event.tv_usec = priv->last_vblank.tv_usec;
+		list_add_tail(&e->base.link, &e->base.file_priv->event_list);
+		wake_up_interruptible(&e->base.file_priv->event_wait);
+	}
 	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 
 	drm_vblank_put(priv->ddev, lx_crtc->id);
@@ -2386,8 +2383,8 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags)
 
 	lx_modeset_init(dev);
 
-	drm_irq_install(dev);
 	drm_vblank_init(dev, 1 /* TODO: LX_NUM_CRTCS */);
+	drm_irq_install(dev);
 	// lx_driver_enable_vblank(dev, LX_CRTC_GRAPHIC);
 
 	rdmsr(0xa0002001, lo, hi);
@@ -2681,10 +2678,9 @@ static int lx_driver_open(struct drm_device *dev, struct drm_file *file)
  */
 static void lx_driver_lastclose(struct drm_device *dev)
 {
-	drm_fb_helper_restore();
 	DRM_DEBUG_DRIVER("\n");
+	drm_fb_helper_restore();
 	vga_switcheroo_process_delayed_switch();
-	// drm_fb_helper_restore_fbdev_mode(&dev->fb.helper);
 }
 
 static void lx_driver_preclose(struct drm_device *dev, struct drm_file *file)
