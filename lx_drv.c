@@ -1089,7 +1089,7 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 	struct lx_priv *priv = file_priv->driver_priv;
 	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
 	struct lx_bo *bo;
-	unsigned max_width;
+	unsigned hw_w, hw_h, hw_p; /* width, height, pitch needed by the hw */
 	u32 gcfg;
 
 	if (lx_crtc->id != LX_CRTC_GRAPHIC) {
@@ -1099,7 +1099,8 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 		 * quite some work to get it going, so ... */
 		DRM_ERROR("cursor is only supported on the graphics crtc\n");
 		/* Maybe later via driver-private IOCTLs
-		 * (TODO: does X support such nonsense, color-keyed cursors?) */
+		 * (TODO: does X support color-keyed cursors overlayed on
+		 *  video?) */
 		return -EINVAL;
 	}
 
@@ -1122,35 +1123,32 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 		return -ENOENT;
 	}
 
-	if (bo->height > 64) {
-		DRM_ERROR("cursor height too high: %u > 64\n", bo->height);
-		return -EINVAL;
-	}
+	gcfg = read_dc(priv, DC_GENERAL_CFG);
+	gcfg |= DC_GENERAL_CFG_CURE; /* enable hardware cursor */
 
 	switch (bo->bpp) {
-	case 2:
-		max_width = 64;
+	case 2: /* monochrome */
+		hw_w = 64;
+		hw_h = 64;
+		hw_p = 2 * 8; /* 16px AND mask, 16px XOR mask */
+		gcfg &= ~DC_GENERAL_CFG_CLR_CUR;
 		break;
-	case 32:
-		max_width = 48;
+	case 32: /* color, ARGB */
+		hw_w = 48;
+		hw_h = 64;
+		hw_p = 192;
+		gcfg |= DC_GENERAL_CFG_CLR_CUR;
 		break;
 	default:
 		DRM_ERROR("cursor bpp unsupported: %u\n", bo->bpp);
 		return -EINVAL;
 	}
-
-	if (bo->width > max_width) {
-		DRM_ERROR("cursor width too high: %u > %u (for %u bpp)\n",
-			  bo->width, max_width, bo->bpp);
+	if (width != hw_w || height != hw_h || bo->pitch != hw_p) {
+		DRM_ERROR("%u bpp cursor dimension must be %ux%u with a pitch "
+			  "of %u bytes (got %ux%u, pitch: %u)\n",
+			  bo->bpp, hw_w, hw_h, hw_p,
+			  width, height, bo->pitch);
 		return -EINVAL;
-	}
-
-	gcfg = read_dc(priv, DC_GENERAL_CFG);
-	gcfg |= DC_GENERAL_CFG_CURE; /* enable hardware cursor */
-	if (bo->bpp == 2) {          /* monochrome cursor? */
-		gcfg &= ~DC_GENERAL_CFG_CLR_CUR;
-	} else {
-		gcfg |= DC_GENERAL_CFG_CLR_CUR;
 	}
 
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);

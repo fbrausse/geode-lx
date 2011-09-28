@@ -331,7 +331,7 @@ enum dc_registers {
 	DC_FB_ST_OFFSET,
 	DC_CB_ST_OFFSET,
 	DC_CURS_ST_OFFSET,
-	DC_RSVD_0,
+	DC_RSVD_0, /* DC_ICON_ST_OFFSET? */
 
 	DC_VID_Y_ST_OFFSET,
 	DC_VID_U_ST_OFFSET,
@@ -355,7 +355,7 @@ enum dc_registers {
 
 	DC_CURSOR_X,
 	DC_CURSOR_Y,
-	DC_RSVD_3,
+	DC_RSVD_3, /* icon x/y? */
 	DC_LINE_CNT,
 
 	DC_PAL_ADDRESS,
