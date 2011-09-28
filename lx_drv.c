@@ -18,12 +18,6 @@
 
 #include "lx.h"
 
-static struct pci_device_id pci_ids[] = {
-	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_LX_VIDEO) },
-	{ 0, }
-};
-MODULE_DEVICE_TABLE(pci, pci_ids);
-
 static void lx_crtc_load_lut(struct drm_crtc *crtc);
 static void lx_crtc_fb_gamma_set(struct drm_crtc *crtc, u16 red, u16 green,
 				 u16 blue, int regno);
@@ -37,7 +31,7 @@ static void lx_crtc_fb_gamma_get(struct drm_crtc *crtc, u16 *red, u16 *green,
 static struct {
 	/* resulting dot freq = 48 MHz * (N + 1) / ((M + 1) * (P + 1))
 	 * minimum pll freq (not post-divided by 4) is 15 MHz */
-	u32 pllval;   /* [15]   : divide output by 4 (unused in this table) */
+	u32 pllval;   /* [16]   : divide output by 4 (unused in this table) */
 	              /* [14:12]: input clock divisor (M) */
 	              /* [11:4] : dot clock PLL divisor (N) */
 	              /* [3:0]  : post scaler divisor (P) */
@@ -364,7 +358,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->fix.smem_start = priv->vmem_phys;
 	info->fix.smem_len = size;
 	/* TODO: use drm_local_map's handle here */
-	info->screen_base = ioremap(priv->vmem_phys, size);
+	info->screen_base = ioremap_wc(priv->vmem_phys, size);
 	info->screen_size = size;
 
 	memset_io(info->screen_base, 0, size);
@@ -1087,6 +1081,8 @@ static void lx_crtc_gamma_set(struct drm_crtc *crtc, u16 *r, u16 *g, u16 *b,
 	lx_crtc_load_lut(crtc);
 }
 
+/* TODO: need wmb's at least for unlock; wmb; stuff; wmb; lock */
+
 static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 			      uint32_t handle, uint32_t width, uint32_t height)
 {
@@ -1190,13 +1186,15 @@ static int lx_crtc_cursor_move(struct drm_crtc *crtc, int x, int y) {
 
 	/* the cursor offset register must always point to the first line to be
 	 * drawn on the screen which isn't line 0 when there is an y-offset */
-	off = bo->node->start + bo->pitch * ry.c.offset;
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+
+	off = bo->node->start + bo->pitch * ry.c.offset;
 	write_dc(priv, DC_CURS_ST_OFFSET, off);
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 
 	write_dc(priv, DC_CURSOR_X, rx.v);
 	write_dc(priv, DC_CURSOR_Y, ry.v);
+
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 
 	return 0;
 }
@@ -1248,6 +1246,7 @@ static void lx_crtc_reset(struct drm_crtc *crtc)
 	wrmsr(MSR_DC_SPARE_MSR, lo, hi);
 }
 
+/* called by drm framework for the page-flip ioctl */
 static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 			     struct drm_pending_vblank_event *event)
 {
@@ -1266,11 +1265,16 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 			 lfb->bo ? (unsigned long)(lfb->bo->node->start + priv->vmem_phys) : 0UL,
 			 lfb->bo ? (unsigned long)(lfb->bo->node->size) : 0UL);
 
-	crtc->fb = fb;
-
+	/* Abuse the event_lock for protecting the event */
 	spin_lock_irqsave(&priv->ddev->event_lock, flags);
+	if (lx_crtc->event) {
+		spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
+		return -EBUSY;
+	}
 	lx_crtc->event = event;
 	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
+
+	crtc->fb = fb;
 
 	ret = drm_vblank_get(priv->ddev, lx_crtc->id);
 	if (ret) {
@@ -1284,6 +1288,7 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	return ret;
 }
 
+/* called from our IRQ handler to process a pending page-flip */
 static void lx_crtc_do_page_flip(struct drm_crtc *crtc) {
 	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
 	struct lx_priv *priv = crtc->dev->dev_private;
@@ -1295,6 +1300,7 @@ static void lx_crtc_do_page_flip(struct drm_crtc *crtc) {
 
 	spin_lock_irqsave(&priv->ddev->event_lock, flags);
 	e = lx_crtc->event;
+	/* TODO: make page-flip work w/o user-event as well */
 	if (!e) {
 		spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 		return;
@@ -1324,9 +1330,6 @@ static const struct drm_crtc_funcs lx_crtc_funcs = {
 	.gamma_set = lx_crtc_gamma_set,
 	.set_config = drm_crtc_helper_set_config,
 	.destroy = drm_crtc_cleanup,
-	/* TODO: these need testing: */
-	.cursor_set = lx_crtc_cursor_set,
-	.cursor_move = lx_crtc_cursor_move,
 	/*
 	 * Flip to the given framebuffer.  This implements the page
 	 * flip ioctl described in drm_mode.h, specifically, the
@@ -1337,25 +1340,9 @@ static const struct drm_crtc_funcs lx_crtc_funcs = {
 	 * completes, otherwise it will be NULL.
 	 */
 	.page_flip = lx_crtc_page_flip,
-	/* crtc->fb = fb;
-	 * my_crtc->event = event;
-	 * omap_gem_op_async(omap_framebuffer_bo(fb), OMAP_GEM_READ,
-	 * 		     page_flip_cb, crtc);
-	 *
-	 * page_flip_cb:
-	 * event = my_crtc->event;
-	 * my_crtc->event = NULL;
-	 * update_scanout;
-	 * commit;
-	 * // after flip: wakeup userspace:
-	 * if (!event) return;
-	 * spin_lock_irqsave(&dev->event_lock, flags);
-	 * event->event.sequence = drm_vblank_count_and_time(dev, some_id, &now);
-	 * event->tv_sec = now.tv_sec;
-	 * event->tv_usec = now.tv_usec;
-	 * list_add_tail(&event->base.link, &event->base.file_priv->event_list);
-	 * wake_up_interruptible(&event->base.file_priv->event_wait);
-	 * spin_unlock_irqrestore(&dev->event_lock, flags); */
+	/* TODO: these need testing: */
+	.cursor_set = lx_crtc_cursor_set,
+	.cursor_move = lx_crtc_cursor_move,
 #if 0
 	/* Save CRTC state */
 	void (*save)(struct drm_crtc *crtc); /* suspend? */
@@ -2373,9 +2360,6 @@ static int lx_driver_device_is_agp(struct drm_device *dev)
 	return 0;
 }
 
-static int lx_driver_enable_vblank(struct drm_device *dev, int crtc);
-static void lx_driver_disable_vblank(struct drm_device *dev, int crtc);
-
 /** @flags: set in pci id list, not needed here */
 int lx_driver_load(struct drm_device *dev, unsigned long flags)
 {
@@ -2457,8 +2441,6 @@ static int lx_driver_unload(struct drm_device *dev)
 	struct lx_priv *priv = dev->dev_private;
 	int ret = 0;
 
-	lx_driver_disable_vblank(dev, LX_CRTC_GRAPHIC);
-
 	if (dev->irq_enabled) {
 		ret = drm_irq_uninstall(dev);
 		if (ret)
@@ -2527,38 +2509,6 @@ static int lx_driver_get_vblank_timestamp(struct drm_device *dev, int crtc,
  */
 static int lx_driver_enable_vblank(struct drm_device *dev, int crtc)
 {
-	struct lx_priv *priv = dev->dev_private;
-	u32 dc_irq_filt_ctl;
-	u32 dc_irq;
-
-	DRM_DEBUG_DRIVER("crtc: %d\n", crtc);
-
-	if (crtc != LX_CRTC_GRAPHIC) {
-		DRM_ERROR("lx: tried enabling vblank irq on illegal CRTC: %d\n",
-			  crtc);
-		return -EINVAL;
-	}
-
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
-
-	/* set line counter */
-	dc_irq_filt_ctl = read_dc(priv, DC_IRQ_FILT_CTL);
-	dc_irq_filt_ctl &= ~0x07ff0000; /* clear bits [26:16] */
-	/* this is really a scanout line trigger (the "real" vblank interrupt
-	 * the Geode provides is an SMM one, so unaccessible to us), but this
-	 * should fit our needs */
-	dc_irq_filt_ctl |= 0 << 16; /* line 0 of scanout buffer */
-	write_dc(priv, DC_IRQ_FILT_CTL, dc_irq_filt_ctl);
-
-	/* enable line count interrupt */
-	dc_irq = read_dc(priv, DC_IRQ);
-	dc_irq &= ~LX_IRQ_STATUS_MASK;  /* don't clear any interrupt status bits
-	                                 * by writing back what was read */
-	dc_irq &= ~DC_IRQ_MASK;         /* unmask line cnt interrupt */
-	write_dc(priv, DC_IRQ, dc_irq);
-
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
-
 	return 0;
 }
 
@@ -2573,22 +2523,6 @@ static int lx_driver_enable_vblank(struct drm_device *dev, int crtc)
  */
 static void lx_driver_disable_vblank(struct drm_device *dev, int crtc)
 {
-	struct lx_priv *priv = dev->dev_private;
-	u32 dc_irq;
-
-	DRM_DEBUG_DRIVER("crtc: %d\n", crtc);
-
-	if (crtc != LX_CRTC_GRAPHIC)
-		return;
-
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
-
-	dc_irq = read_dc(priv, DC_IRQ);
-	dc_irq &= ~LX_IRQ_STATUS_MASK; /* don't clear any interrupt status bits */
-	dc_irq |= DC_IRQ_MASK; /* mask line cnt interrupt */
-	write_dc(priv, DC_IRQ, dc_irq);
-
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 }
 
 static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
@@ -2646,12 +2580,53 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 	return ret;
 }
 
+static void lx_irq_enable_vblank(struct drm_device *dev)
+{
+	struct lx_priv *priv = dev->dev_private;
+	u32 dc_irq_filt_ctl;
+	u32 dc_irq;
+
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+
+	/* set line counter */
+	dc_irq_filt_ctl = read_dc(priv, DC_IRQ_FILT_CTL);
+	dc_irq_filt_ctl &= ~0x07ff0000; /* clear bits [26:16] */
+	/* this is really a scanout line trigger (the "real" vblank interrupt
+	 * the Geode provides is an SMM one, so unaccessible to us), but this
+	 * should fit our needs */
+	dc_irq_filt_ctl |= 0 << 16; /* line 0 of scanout buffer */
+	write_dc(priv, DC_IRQ_FILT_CTL, dc_irq_filt_ctl);
+
+	/* enable line count interrupt */
+	dc_irq = read_dc(priv, DC_IRQ);
+	dc_irq &= ~LX_IRQ_STATUS_MASK;  /* don't clear any interrupt status bits
+	                                 * by writing back what was read */
+	dc_irq &= ~DC_IRQ_MASK;         /* unmask line cnt interrupt */
+	write_dc(priv, DC_IRQ, dc_irq);
+
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+}
+
+static void lx_irq_disable_vblank(struct drm_device *dev)
+{
+	struct lx_priv *priv = dev->dev_private;
+	u32 dc_irq;
+
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+
+	dc_irq = read_dc(priv, DC_IRQ);
+	dc_irq &= ~LX_IRQ_STATUS_MASK; /* don't clear any interrupt status bits */
+	dc_irq |= DC_IRQ_MASK; /* mask line cnt interrupt */
+	write_dc(priv, DC_IRQ, dc_irq);
+
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+}
+
 static void lx_driver_irq_preinstall(struct drm_device *dev)
 {
 	struct lx_priv *priv = dev->dev_private;
 
-	DRM_DEBUG_DRIVER("\n");
-	/* TODO: disable all interrupts */
+	/* disable all interrupts */
 
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
 
@@ -2666,18 +2641,14 @@ static void lx_driver_irq_preinstall(struct drm_device *dev)
 
 static int lx_driver_irq_postinstall(struct drm_device *dev)
 {
-	DRM_DEBUG_DRIVER("\n");
-	/* TODO: enable interrupts: vblank */
-
-	lx_driver_enable_vblank(dev, LX_CRTC_GRAPHIC);
+	lx_irq_enable_vblank(dev);
 
 	return 0;
 }
 
 static void lx_driver_irq_uninstall(struct drm_device *dev)
 {
-	DRM_DEBUG_DRIVER("\n");
-	lx_driver_disable_vblank(dev, LX_CRTC_GRAPHIC);
+	lx_irq_disable_vblank(dev);
 	lx_driver_irq_preinstall(dev);
 }
 
@@ -2710,9 +2681,10 @@ static int lx_driver_open(struct drm_device *dev, struct drm_file *file)
  */
 static void lx_driver_lastclose(struct drm_device *dev)
 {
-	// drm_fb_helper_restore();
+	drm_fb_helper_restore();
 	DRM_DEBUG_DRIVER("\n");
 	vga_switcheroo_process_delayed_switch();
+	// drm_fb_helper_restore_fbdev_mode(&dev->fb.helper);
 }
 
 static void lx_driver_preclose(struct drm_device *dev, struct drm_file *file)
@@ -2837,7 +2809,7 @@ static int lx_driver_dumb_destroy(struct drm_file *file_priv,
 	return 0;
 }
 
-static struct drm_driver driver = {
+static struct drm_driver lx_driver = {
 	.driver_features	= DRIVER_HAVE_IRQ | DRIVER_IRQ_SHARED |
 				  DRIVER_MODESET,
 	.dev_priv_size		= sizeof(struct lx_priv),
@@ -2848,24 +2820,23 @@ static struct drm_driver driver = {
 	.irq_postinstall	= lx_driver_irq_postinstall,
 	.irq_uninstall		= lx_driver_irq_uninstall,
 	.irq_handler		= lx_driver_irq_handler,
-	// .enable_vblank		= lx_driver_enable_vblank,
-	// .disable_vblank		= lx_driver_disable_vblank,
-	.enable_vblank		= lx_driver_device_is_agp,
-	.disable_vblank		= lx_driver_device_is_agp,
+	.enable_vblank		= lx_driver_enable_vblank,
+	.disable_vblank		= lx_driver_disable_vblank,
 	.get_vblank_counter	= drm_vblank_count,
 	.get_vblank_timestamp	= lx_driver_get_vblank_timestamp,
 
-	/* These are stubs ... */
+	/* These need rework ... */
 	.open			= lx_driver_open,
 	.lastclose		= lx_driver_lastclose,
 	.preclose		= lx_driver_preclose,
 	.postclose		= lx_driver_postclose,
-	.ioctls			= lx_ioctls,
-	.num_ioctls		= ARRAY_SIZE(lx_ioctls),
-
 	.dumb_create		= lx_driver_dumb_create,
 	.dumb_map_offset	= lx_driver_dumb_map_offset,
 	.dumb_destroy		= lx_driver_dumb_destroy,
+
+	/* These are stubs ... */
+	.ioctls			= lx_ioctls,
+	.num_ioctls		= ARRAY_SIZE(lx_ioctls),
 #if 0
 	.reclaim_buffers	= drm_core_reclaim_buffers,
 	.get_scanout_position   = lx_driver_get_scanout_position,
@@ -2895,7 +2866,7 @@ static int __devinit lx_pci_probe(struct pci_dev *pdev,
 				  const struct pci_device_id *ent)
 {
 	DRM_DEBUG_DRIVER("\n");
-	return drm_get_pci_dev(pdev, ent, &driver);
+	return drm_get_pci_dev(pdev, ent, &lx_driver);
 }
 
 static void __devexit lx_pci_remove(struct pci_dev *pdev)
@@ -2905,6 +2876,12 @@ static void __devexit lx_pci_remove(struct pci_dev *pdev)
 	drm_put_dev(dev);
 }
 
+static const struct pci_device_id __devinitconst pci_ids[] = {
+	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_LX_VIDEO) },
+	{ 0, }
+};
+MODULE_DEVICE_TABLE(pci, pci_ids);
+
 static struct pci_driver lx_pci_driver = {
 	.name = DRIVER_NAME,
 	.id_table = pci_ids,
@@ -2913,11 +2890,11 @@ static struct pci_driver lx_pci_driver = {
 };
 
 static int __init lx_init(void) {
-	return drm_pci_init(&driver, &lx_pci_driver);
+	return drm_pci_init(&lx_driver, &lx_pci_driver);
 }
 
 static void __exit lx_exit(void) {
-	drm_pci_exit(&driver, &lx_pci_driver);
+	drm_pci_exit(&lx_driver, &lx_pci_driver);
 }
 
 module_init(lx_init);

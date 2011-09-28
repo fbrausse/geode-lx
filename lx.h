@@ -450,6 +450,7 @@ enum dc_registers {
 #define DC_IRQ_FILT_CTL_FILT_ENA	(1 << 12)
 #define DC_IRQ_FILT_CTL_INTL_EN		(1 << 11)
 #define DC_IRQ_FILT_CTL_H_FILT_SEL	(1 << 10)
+#define DC_IRQ_FILT_CTL_LINEBUF_REG_EN	(1 << 9) /* rsvd, see bits [30:29] */
 
 #define DC_CLR_KEY_CLR_KEY_EN		(1 << 24)
 
