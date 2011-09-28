@@ -1296,7 +1296,7 @@ static void lx_crtc_do_page_flip(struct drm_crtc *crtc) {
 	spin_lock_irqsave(&priv->ddev->event_lock, flags);
 	e = lx_crtc->event;
 	if (!e) {
-		// spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
+		spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 		return;
 	}
 	lx_crtc->event = NULL;
@@ -1317,7 +1317,7 @@ static void lx_crtc_do_page_flip(struct drm_crtc *crtc) {
 
 	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 
-	// drm_vblank_put(priv->ddev, lx_crtc->id);
+	drm_vblank_put(priv->ddev, lx_crtc->id);
 }
 
 static const struct drm_crtc_funcs lx_crtc_funcs = {
