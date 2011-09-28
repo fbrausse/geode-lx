@@ -1252,8 +1252,11 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 			     struct drm_pending_vblank_event *event)
 {
 	struct lx_priv *priv = crtc->dev->dev_private;
+	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
 	struct lx_fb *lfb = to_lx_fb(fb);
 	struct lx_fb *lfb2 = to_lx_fb(crtc->fb);
+	unsigned long flags;
+	int ret;
 
 	DRM_DEBUG_DRIVER("pipe: %d, old fb: %p, bo @ %lx, size: %lu; new fb: %p, bo @ %lx, size: %lu\n",
 			 event->pipe, crtc->fb,
@@ -1263,7 +1266,58 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 			 lfb->bo ? (unsigned long)(lfb->bo->node->start + priv->vmem_phys) : 0UL,
 			 lfb->bo ? (unsigned long)(lfb->bo->node->size) : 0UL);
 
-	return 1;
+	crtc->fb = fb;
+
+	spin_lock_irqsave(&priv->ddev->event_lock, flags);
+	lx_crtc->event = event;
+	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
+
+	ret = drm_vblank_get(priv->ddev, lx_crtc->id);
+	if (ret) {
+		DRM_ERROR("failed to get vblank event before page flip: %d\n", ret);
+		lx_crtc->event = NULL;
+	}
+	DRM_DEBUG_DRIVER("vblank enabled: %d, vblank refcnt: %d\n",
+			 priv->ddev->vblank_enabled[0],
+			 priv->ddev->vblank_refcount[0].counter);
+
+	return ret;
+}
+
+static void lx_crtc_do_page_flip(struct drm_crtc *crtc) {
+	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
+	struct lx_priv *priv = crtc->dev->dev_private;
+	struct drm_framebuffer *fb = crtc->fb;
+	struct lx_fb *lfb = to_lx_fb(fb);
+	struct drm_pending_vblank_event *e;
+	unsigned offset;
+	unsigned long flags;
+
+	spin_lock_irqsave(&priv->ddev->event_lock, flags);
+	e = lx_crtc->event;
+	if (!e) {
+		// spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
+		return;
+	}
+	lx_crtc->event = NULL;
+
+	offset = (lfb->bo) ? lfb->bo->node->start : 0;
+	offset += crtc->y * fb->pitch + crtc->x * ALIGN(fb->bits_per_pixel, 8) / 8;
+
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	write_dc(priv, DC_FB_ST_OFFSET, offset);
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+
+	/* wakeup userspace */
+	e->event.sequence = drm_vblank_count(priv->ddev, lx_crtc->id);
+	e->event.tv_sec = priv->last_vblank.tv_sec;
+	e->event.tv_usec = priv->last_vblank.tv_usec;
+	list_add_tail(&e->base.link, &e->base.file_priv->event_list);
+	wake_up_interruptible(&e->base.file_priv->event_wait);
+
+	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
+
+	// drm_vblank_put(priv->ddev, lx_crtc->id);
 }
 
 static const struct drm_crtc_funcs lx_crtc_funcs = {
@@ -1273,6 +1327,15 @@ static const struct drm_crtc_funcs lx_crtc_funcs = {
 	/* TODO: these need testing: */
 	.cursor_set = lx_crtc_cursor_set,
 	.cursor_move = lx_crtc_cursor_move,
+	/*
+	 * Flip to the given framebuffer.  This implements the page
+	 * flip ioctl described in drm_mode.h, specifically, the
+	 * implementation must return immediately and block all
+	 * rendering to the current fb until the flip has completed.
+	 * If userspace set the event flag in the ioctl, the event
+	 * argument will point to an event to send back when the flip
+	 * completes, otherwise it will be NULL.
+	 */
 	.page_flip = lx_crtc_page_flip,
 	/* crtc->fb = fb;
 	 * my_crtc->event = event;
@@ -1300,19 +1363,6 @@ static const struct drm_crtc_funcs lx_crtc_funcs = {
 	void (*restore)(struct drm_crtc *crtc); /* resume? */
 	/* Reset CRTC state */
 	void (*reset)(struct drm_crtc *crtc);
-
-	/*
-	 * Flip to the given framebuffer.  This implements the page
-	 * flip ioctl described in drm_mode.h, specifically, the
-	 * implementation must return immediately and block all
-	 * rendering to the current fb until the flip has completed.
-	 * If userspace set the event flag in the ioctl, the event
-	 * argument will point to an event to send back when the flip
-	 * completes, otherwise it will be NULL.
-	 */
-	int (*page_flip)(struct drm_crtc *crtc,
-			 struct drm_framebuffer *fb,
-			 struct drm_pending_vblank_event *event);
 #endif
 };
 
@@ -1544,7 +1594,8 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	 * otherwise. */
 	offset = (lfb->bo) ? lfb->bo->node->start : 0;
 	offset += y * fb->pitch + x * ((fb->bits_per_pixel + 7) / 8);
-	write_dc(priv, DC_FB_ST_OFFSET, offset << 3);
+	DRM_DEBUG_DRIVER("fb offset: %x\n", offset);
+	write_dc(priv, DC_FB_ST_OFFSET, offset);
 
 	/* TODO: write compressed buffer offset */
 	/* TODO: write cursor buffer offset */
@@ -1694,7 +1745,7 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 
 	/* trigger line count IRQ when vblank starts (if IRQ is enabled) */
 	/* TODO: graphics/flicker/alpha filter, interlacing */
-	write_dc(priv, DC_IRQ_FILT_CTL, m->crtc_vblank_start << 16);
+	// write_dc(priv, DC_IRQ_FILT_CTL, 0*m->crtc_vblank_start << 16);
 
 	/* disable VBI */
 	write_dc(priv, DC_VBI_EVEN_CTL, 0);
@@ -2322,6 +2373,9 @@ static int lx_driver_device_is_agp(struct drm_device *dev)
 	return 0;
 }
 
+static int lx_driver_enable_vblank(struct drm_device *dev, int crtc);
+static void lx_driver_disable_vblank(struct drm_device *dev, int crtc);
+
 /** @flags: set in pci id list, not needed here */
 int lx_driver_load(struct drm_device *dev, unsigned long flags)
 {
@@ -2350,6 +2404,7 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags)
 
 	drm_irq_install(dev);
 	drm_vblank_init(dev, 1 /* TODO: LX_NUM_CRTCS */);
+	// lx_driver_enable_vblank(dev, LX_CRTC_GRAPHIC);
 
 	rdmsr(0xa0002001, lo, hi);
 	DRM_DEBUG_DRIVER("GP GLD config: %08x\n", lo);
@@ -2381,12 +2436,14 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags)
 			!!(hi & (1 << 28)), ((hi << 12) | (lo >> 20)) & 0xfffff,
 			lo & 0xfffff);
 	}
-	
+
 	lo = read_dc(priv, DC_GLIU0_MEM_OFFSET);
 	hi = read_dc(priv, DC_DV_CTL);
 	DRM_DEBUG_DRIVER("DC GLIU0 mem offset: @ %03x MB, "
 		"DV RAM address: %03x, offset: %05x\n",
 		lo >> 20, lo & 0x7ff, hi >> 12);
+
+	DRM_DEBUG_DRIVER("FP PM: %08x\n", read_fp(priv, FP_PM));
 
 	return 0;
 
@@ -2399,6 +2456,8 @@ static int lx_driver_unload(struct drm_device *dev)
 {
 	struct lx_priv *priv = dev->dev_private;
 	int ret = 0;
+
+	lx_driver_disable_vblank(dev, LX_CRTC_GRAPHIC);
 
 	if (dev->irq_enabled) {
 		ret = drm_irq_uninstall(dev);
@@ -2472,6 +2531,8 @@ static int lx_driver_enable_vblank(struct drm_device *dev, int crtc)
 	u32 dc_irq_filt_ctl;
 	u32 dc_irq;
 
+	DRM_DEBUG_DRIVER("crtc: %d\n", crtc);
+
 	if (crtc != LX_CRTC_GRAPHIC) {
 		DRM_ERROR("lx: tried enabling vblank irq on illegal CRTC: %d\n",
 			  crtc);
@@ -2482,9 +2543,9 @@ static int lx_driver_enable_vblank(struct drm_device *dev, int crtc)
 
 	/* set line counter */
 	dc_irq_filt_ctl = read_dc(priv, DC_IRQ_FILT_CTL);
-	dc_irq_filt_ctl &= ~(((1 << 11) - 1) << 16); /* clear bits [26:16] */
+	dc_irq_filt_ctl &= ~0x07ff0000; /* clear bits [26:16] */
 	/* this is really a scanout line trigger (the "real" vblank interrupt
-	 * the Geode provides is an SMM one, so unaccessible to us), but that
+	 * the Geode provides is an SMM one, so unaccessible to us), but this
 	 * should fit our needs */
 	dc_irq_filt_ctl |= 0 << 16; /* line 0 of scanout buffer */
 	write_dc(priv, DC_IRQ_FILT_CTL, dc_irq_filt_ctl);
@@ -2510,9 +2571,12 @@ static int lx_driver_enable_vblank(struct drm_device *dev, int crtc)
  * a hardware vblank counter, this routine should be a no-op, since
  * interrupts will have to stay on to keep the count accurate.
  */
-static void lx_driver_disable_vblank(struct drm_device *dev, int crtc) {
+static void lx_driver_disable_vblank(struct drm_device *dev, int crtc)
+{
 	struct lx_priv *priv = dev->dev_private;
 	u32 dc_irq;
+
+	DRM_DEBUG_DRIVER("crtc: %d\n", crtc);
 
 	if (crtc != LX_CRTC_GRAPHIC)
 		return;
@@ -2527,7 +2591,8 @@ static void lx_driver_disable_vblank(struct drm_device *dev, int crtc) {
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 }
 
-static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS) {
+static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
+{
 	struct drm_device *dev = arg;
 	struct lx_priv *priv = dev->dev_private;
 	irqreturn_t ret = IRQ_NONE;
@@ -2558,12 +2623,14 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS) {
 
 
 	if (dc_irq & DC_IRQ_STATUS) {
-		/* programmed line counter value (0) has been reached */
 		do_gettimeofday(&priv->last_vblank);
+
+		/* process possibly pending page flip */
+		lx_crtc_do_page_flip(&priv->crtcs[LX_CRTC_GRAPHIC].base);
+
+		/* programmed line counter value (0) has been reached */
 		drm_handle_vblank(dev, LX_CRTC_GRAPHIC);
 		ret = IRQ_HANDLED;
-
-		/* TODO: process any page flips, etc. */
 	}
 	if (dc_irq & DC_IRQ_VIP_VSYNC_IRQ_STATUS) {
 		ret = IRQ_HANDLED;
@@ -2579,28 +2646,38 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS) {
 	return ret;
 }
 
-static void lx_driver_irq_preinstall(struct drm_device *dev) {
+static void lx_driver_irq_preinstall(struct drm_device *dev)
+{
 	struct lx_priv *priv = dev->dev_private;
 
 	DRM_DEBUG_DRIVER("\n");
 	/* TODO: disable all interrupts */
+
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
 
 	/* DC: line cnt & vip vsync loss interrupts */
 	write_dc(priv, DC_IRQ, DC_IRQ_MASK | DC_IRQ_VIP_VSYNC_IRQ_MASK);
 	/* GP: idle & cmd buffer empty */
 	write_gp(priv, GP_INT_CNTRL, GP_INT_IDLE_MASK |
 				     GP_INT_CMD_BUF_EMPTY_MASK);
+
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 }
 
-static int lx_driver_irq_postinstall(struct drm_device *dev) {
+static int lx_driver_irq_postinstall(struct drm_device *dev)
+{
 	DRM_DEBUG_DRIVER("\n");
 	/* TODO: enable interrupts: vblank */
+
+	lx_driver_enable_vblank(dev, LX_CRTC_GRAPHIC);
 
 	return 0;
 }
 
-static void lx_driver_irq_uninstall(struct drm_device *dev) {
+static void lx_driver_irq_uninstall(struct drm_device *dev)
+{
 	DRM_DEBUG_DRIVER("\n");
+	lx_driver_disable_vblank(dev, LX_CRTC_GRAPHIC);
 	lx_driver_irq_preinstall(dev);
 }
 
@@ -2771,8 +2848,10 @@ static struct drm_driver driver = {
 	.irq_postinstall	= lx_driver_irq_postinstall,
 	.irq_uninstall		= lx_driver_irq_uninstall,
 	.irq_handler		= lx_driver_irq_handler,
-	.enable_vblank		= lx_driver_enable_vblank,
-	.disable_vblank		= lx_driver_disable_vblank,
+	// .enable_vblank		= lx_driver_enable_vblank,
+	// .disable_vblank		= lx_driver_disable_vblank,
+	.enable_vblank		= lx_driver_device_is_agp,
+	.disable_vblank		= lx_driver_device_is_agp,
 	.get_vblank_counter	= drm_vblank_count,
 	.get_vblank_timestamp	= lx_driver_get_vblank_timestamp,
 
