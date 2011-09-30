@@ -361,7 +361,9 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->screen_base = ioremap_wc(priv->vmem_phys, size);
 	info->screen_size = size;
 
+	/* TODO: unneeded?
 	memset_io(info->screen_base, 0, size);
+	*/
 
 	drm_fb_helper_fill_var(info, helper, sizes->fb_width, sizes->fb_height);
 
@@ -1123,27 +1125,31 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 		DRM_ERROR("handle %d does not exist\n", handle);
 		return -ENOENT;
 	}
+	if (bo->width != width || bo->height != height) {
+		DRM_ERROR("bo-dimensions (%ux%u) are inconsistent with "
+			  "requested cursor size (%ux%u)\n",
+			  bo->width, bo->height, width, height);
+		return -EINVAL;
+	}
 
 	gcfg = read_dc(priv, DC_GENERAL_CFG);
 	gcfg |= DC_GENERAL_CFG_CURE; /* enable hardware cursor */
 
 	switch (bo->bpp) {
-	case 2: /* monochrome */
+	case 2: /* monochrome, 16px AND mask, 16px XOR mask */
 		hw_w = 64;
-		hw_h = 64;
-		hw_p = 2 * 8; /* 16px AND mask, 16px XOR mask */
 		gcfg &= ~DC_GENERAL_CFG_CLR_CUR;
 		break;
 	case 32: /* color, ARGB */
 		hw_w = 48;
-		hw_h = 64;
-		hw_p = 192;
 		gcfg |= DC_GENERAL_CFG_CLR_CUR;
 		break;
 	default:
 		DRM_ERROR("cursor bpp unsupported: %u\n", bo->bpp);
 		return -EINVAL;
 	}
+	hw_h = 64;
+	hw_p = hw_w * bo->bpp / 8;
 	if (width != hw_w || height != hw_h || bo->pitch != hw_p) {
 		DRM_ERROR("%u bpp cursor dimension must be %ux%u with a pitch "
 			  "of %u bytes (got %ux%u, pitch: %u)\n",
@@ -1152,10 +1158,14 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 		return -EINVAL;
 	}
 
+	/* bo->node->start must always be 32 byte aligned */
+	BUG_ON(bo->node->start & 0x1f);
+
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
-	/* bo->node->start is 32 byte aligned */
+	wmb();
 	write_dc(priv, DC_CURS_ST_OFFSET, bo->node->start);
 	write_dc(priv, DC_GENERAL_CFG, gcfg);
+	wmb();
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 
 	lx_crtc->cursor_bo = bo;
@@ -1163,40 +1173,50 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 	return 0;
 }
 
-static int lx_crtc_cursor_move(struct drm_crtc *crtc, int x, int y) {
+static int lx_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
+{
 	struct lx_priv *priv = crtc->dev->dev_private;
 	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
-	union {
-		struct {
-			u32 coord  : 11;
-			u32 offset : 6;
-			u32 pad    : 15;
-		} c;
-		u32 v;
-	} rx = { { .offset = x < 0 ? -x : 0, .coord = x < 0 ? 0 : x, } },
-	  ry = { { .offset = y < 0 ? -y : 0, .coord = y < 0 ? 0 : y, } };
 	struct lx_bo *bo = lx_crtc->cursor_bo;
-	u32 off;
 
 	if (lx_crtc->id != LX_CRTC_GRAPHIC) {
 		DRM_ERROR("cursor is only supported on the graphics crtc\n");
 		return -EINVAL;
 	}
-	if (!bo || !bo->node) {
-		DRM_ERROR("trying to move non-existant cursor\n");
+	if (!bo) {
+		DRM_DEBUG_DRIVER("ERROR: trying to move non-existant cursor\n");
 		return -EINVAL;
 	}
 
-	/* the cursor offset register must always point to the first line to be
-	 * drawn on the screen which isn't line 0 when there is an y-offset */
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	wmb();
+	{
+		union {
+			struct {
+				u32 coord  : 11;
+				u32 offset : 6;
+				u32 pad    : 15;
+			} c;
+			u32 v;
+		} rx = { {
+			.offset = x < 0 ? min_t(u32, -x, bo->width - 1) : 0,
+			.coord  = x < 0 ? 0 : x,
+		} },
+		  ry = { {
+			.offset = y < 0 ? min_t(u32, -y, bo->height - 1) : 0,
+			.coord  = y < 0 ? 0 : y,
+		} };
 
-	off = bo->node->start + bo->pitch * ry.c.offset;
-	write_dc(priv, DC_CURS_ST_OFFSET, off);
+		/* the cursor offset register must always point to the first
+		 * line to be drawn on the screen */
+		u32 off = bo->node->start + bo->pitch * ry.c.offset;
 
-	write_dc(priv, DC_CURSOR_X, rx.v);
-	write_dc(priv, DC_CURSOR_Y, ry.v);
+		write_dc(priv, DC_CURS_ST_OFFSET, off);
 
+		write_dc(priv, DC_CURSOR_X, rx.v);
+		write_dc(priv, DC_CURSOR_Y, ry.v);
+	}
+	wmb();
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 
 	return 0;
@@ -1211,6 +1231,9 @@ static void lx_crtc_reset(struct drm_crtc *crtc)
 	return;
 
 	/* Clear the various buffers */
+
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	wmb();
 
 	write_dc(priv, DC_FB_ST_OFFSET, 0);
 	write_dc(priv, DC_CB_ST_OFFSET, 0);
@@ -1240,6 +1263,10 @@ static void lx_crtc_reset(struct drm_crtc *crtc)
 #if 0 /* don't overwrite offset as set by the BIOS */
 	write_dc(priv, DC_DV_CTL, DC_DV_CTL_DV_MASK | DC_DV_CTL_CLEAR_DV_RAM);
 #endif
+
+	wmb();
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+
 	/* set default watermark values */
 
 	rdmsr(MSR_DC_SPARE_MSR, lo, hi);
@@ -1446,8 +1473,8 @@ static bool lx_video_overlay_enabled(struct drm_crtc *crtc) {
 
 enum lx_cursor_status {
 	CURSOR_DISABLED,
-	CURSOR_2BPP,
-	CURSOR_32BPP,
+	CURSOR_MONOCHROME,
+	CURSOR_COLOR,
 };
 
 /* in 256 bytes */
@@ -1457,8 +1484,13 @@ enum lx_cursor_status {
 #define VID_OVL_PRIO_HIGH_END		0xb
 #define VID_OVL_PRIO_HIGH_START		0x6
 
-static enum lx_cursor_status lx_cursor_status(struct drm_crtc *crtc) {
-	return CURSOR_DISABLED;
+static enum lx_cursor_status lx_cursor_status(struct drm_crtc *crtc)
+{
+	struct lx_bo *cursor_bo = to_lx_crtc(crtc)->cursor_bo;
+
+	if (!crtc->fb || !cursor_bo)
+		return CURSOR_DISABLED;
+	return cursor_bo->bpp == 2 ? CURSOR_MONOCHROME : CURSOR_COLOR;
 }
 
 static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
@@ -1521,11 +1553,11 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	case CURSOR_DISABLED:
 		gcfg &= ~DC_GENERAL_CFG_CURE;
 		break;
-	case CURSOR_2BPP:
+	case CURSOR_MONOCHROME:
 		gcfg |= DC_GENERAL_CFG_CURE;
 		gcfg &= ~DC_GENERAL_CFG_CLR_CUR;
 		break;
-	case CURSOR_32BPP:
+	case CURSOR_COLOR:
 		gcfg |= DC_GENERAL_CFG_CURE;
 		gcfg |= DC_GENERAL_CFG_CLR_CUR;
 		break;
@@ -2696,11 +2728,17 @@ static int lx_idr_free(int id, void *p, void *data)
 
 static void lx_driver_postclose(struct drm_device *dev, struct drm_file *file)
 {
+	struct lx_priv *priv = dev->dev_private;
+	unsigned i;
+
 	DRM_DEBUG_DRIVER("\n");
 
 	idr_for_each(&file->object_idr, lx_idr_free, file);
 	idr_remove_all(&file->object_idr);
 	idr_destroy(&file->object_idr);
+
+	for (i = 0; i < LX_NUM_CRTCS; i++)
+		priv->crtcs[i].cursor_bo = NULL;
 
 	file->driver_priv = NULL;
 }
