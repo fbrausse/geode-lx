@@ -210,8 +210,8 @@ static int lx_user_fb_create_handle(struct drm_framebuffer *fb,
 		return -ENOENT;
 	}
 
-	*handle = lfb->bo->id;
 	DRM_DEBUG_DRIVER("handle: %d\n", lfb->bo->id);
+	*handle = lfb->bo->id;
 
 	return 0;
 }
@@ -1073,6 +1073,7 @@ static void lx_crtc_gamma_set(struct drm_crtc *crtc, u16 *r, u16 *g, u16 *b,
 	end = (start + size > LX_LUT_SIZE) ? LX_LUT_SIZE : (start + size);
 
 	for (i = start, lut_entry = lx_crtc->lut; i < end; i++, lut_entry++) {
+		DRM_DEBUG_DRIVER("%02x: %04hx %04hx %04hx\n", i, r[i], g[i], b[i]);
 		lut_entry->r = r[i] >> 8;
 		lut_entry->g = g[i] >> 8;
 		lut_entry->b = b[i] >> 8;
@@ -1179,6 +1180,10 @@ static int lx_crtc_cursor_move(struct drm_crtc *crtc, int x, int y) {
 
 	if (lx_crtc->id != LX_CRTC_GRAPHIC) {
 		DRM_ERROR("cursor is only supported on the graphics crtc\n");
+		return -EINVAL;
+	}
+	if (!bo || !bo->node) {
+		DRM_ERROR("trying to move non-existant cursor\n");
 		return -EINVAL;
 	}
 
@@ -1529,7 +1534,6 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	write_dc(priv, DC_GENERAL_CFG, gcfg);
 
 	dcfg = 0;
-	dcfg &= ~DC_DISPLAY_CFG_PALB; /* never bypass gamma / palette RAM */
 	dcfg |= DC_DISPLAY_CFG_DCEN; /* center display on flat panels */
 
 	if (lx_video_overlay_enabled(crtc)) {
@@ -1560,7 +1564,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	if (lx_video_overlay_enabled(crtc)) /* enable video data pass-through */
 		dcfg |= DC_DISPLAY_CFG_VDEN;
 
-	dcfg |= DC_DISPLAY_CFG_PALB; /* palette bypass in > 8bpp modes */
+	dcfg &= ~DC_DISPLAY_CFG_PALB; /* no palette bypass in > 8bpp modes */
 	dcfg |= DC_DISPLAY_CFG_GDEN; /* enable graphics data pass-through */
 	dcfg |= DC_DISPLAY_CFG_TGEN; /* enable timing generator */
 	dcfg |= DC_DISPLAY_CFG_TRUP; /* update timings immediatly */
@@ -1778,7 +1782,7 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 
 	/* VP display configuration */
 	vcfg = read_vp(priv, VP_DCFG);
-	vcfg &= ~VP_DCFG_GV_GAM; /* select gamma RAM for graphics */
+	vcfg |= VP_DCFG_GV_GAM; /* select VP's gamma RAM for the video stream */
 
 	if (m->flags & DRM_MODE_FLAG_NHSYNC) {  /* polarity of active edge */
 		vcfg |= VP_DCFG_CRT_HSYNC_POL;  /* low */
@@ -1824,24 +1828,15 @@ static void lx_crtc_load_lut(struct drm_crtc *crtc)
 	if (!crtc->enabled)
 		return;
 
-	/* TODO: disable BYP_BOTH in VP's MISC MSR */
-	/* TODO: enable GV_GAM in VP's DCFG MSR */
+	/* copy values to DC's Palette / Gamma space */
+	write_dc(priv, DC_PAL_ADDRESS, 0);
 
-	/* TODO: Geode GX rev 2.1 Spec Update, 1.38:
-	 *       if (GV_GAM) {
-	 *           GV_GAM = 0,
-	 *           wait for next vsync
-	 *       }
-	 *       change gamma RAM */
-
-	/* copy values to VP's PDR space */
-	write_vp(priv, VP_PAR, 0);
-
-	/* todo: regard mode_config.depth */
+	/* TODO: regard mode_config.depth */
 
 	for (i = 0; i < LX_LUT_SIZE; i++) {
-		/* writes to VP_PDR (palette data @VP_PAR) increase VP_PAR */
-		write_vp(priv, VP_PDR,
+		/* accesses to DC_PAL_DATA (palette data @DC_PAL_ADDRESS)
+		 * increase DC_PAL_ADDRESS */
+		write_dc(priv, DC_PAL_DATA,
 			 lx_crtc->lut[i].r << 16 |
 			 lx_crtc->lut[i].g <<  8 |
 			 lx_crtc->lut[i].b <<  0);

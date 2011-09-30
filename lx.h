@@ -25,6 +25,14 @@
 #include <ttm/ttm_module.h>
 #include <ttm/ttm_page_alloc.h>
 
+/* TODO:
+ * - connector / output {DPMS property,subpixel?}
+ * - argb-cursor really needs to be 64x64 sized
+ * - DRM_MODE_PROP_{IMMUTABLE,RANGE,ENUM}
+ * - don't return handle 0 for anything (maybe use for fbcon's fb)
+ * - set mode_config.{max_cursor_{width,height},preferred_depth,prefer_shadow}
+ */
+
 
 /* VGA <- DAC 24 bit (video/graphics input)
  * LVDS <- LVDS 24 bit (video/graphics input) several bit depths
@@ -108,6 +116,8 @@ struct lx_encoder {
 };
 
 /* 256 x 24 bit palette / gamma CLUT + 5 x 24 bit overlay colors */
+/* The DC's palette RAM is used for graphics and VP's palette RAM is unused for
+ * now */
 #define LX_LUT_PAL_GAMMA_START	0x000
 #define LX_LUT_PAL_GAMMA_STOP	0x100
 /* cursor and icon overlay */
