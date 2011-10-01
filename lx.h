@@ -681,4 +681,18 @@ static inline void write_vop(struct lx_priv *priv, int reg, uint32_t val)
 	DRM_WRITE32(priv->vp, 8 * reg + VP_VOP_START, val);
 }
 
+/* helper functions */
+
+static inline void dc_unlock(struct lx_priv *priv)
+{
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	wmb();
+}
+
+static inline void dc_lock(struct lx_priv *priv)
+{
+	wmb();
+	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+}
+
 #endif

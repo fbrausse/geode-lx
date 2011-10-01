@@ -1114,9 +1114,9 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 
 		lx_crtc->cursor_bo = NULL;
 
-		write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+		dc_unlock(priv);
 		write_dc(priv, DC_GENERAL_CFG, gcfg);
-		write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+		dc_lock(priv);
 		return 0;
 	}
 
@@ -1161,12 +1161,10 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 	/* bo->node->start must always be 32 byte aligned */
 	BUG_ON(bo->node->start & 0x1f);
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
-	wmb();
+	dc_unlock(priv);
 	write_dc(priv, DC_CURS_ST_OFFSET, bo->node->start);
 	write_dc(priv, DC_GENERAL_CFG, gcfg);
-	wmb();
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 
 	lx_crtc->cursor_bo = bo;
 
@@ -1188,8 +1186,7 @@ static int lx_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
 		return -EINVAL;
 	}
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
-	wmb();
+	dc_unlock(priv);
 	{
 		union {
 			struct {
@@ -1216,8 +1213,7 @@ static int lx_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
 		write_dc(priv, DC_CURSOR_X, rx.v);
 		write_dc(priv, DC_CURSOR_Y, ry.v);
 	}
-	wmb();
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 
 	return 0;
 }
@@ -1232,8 +1228,7 @@ static void lx_crtc_reset(struct drm_crtc *crtc)
 
 	/* Clear the various buffers */
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
-	wmb();
+	dc_unlock(priv);
 
 	write_dc(priv, DC_FB_ST_OFFSET, 0);
 	write_dc(priv, DC_CB_ST_OFFSET, 0);
@@ -1264,8 +1259,7 @@ static void lx_crtc_reset(struct drm_crtc *crtc)
 	write_dc(priv, DC_DV_CTL, DC_DV_CTL_DV_MASK | DC_DV_CTL_CLEAR_DV_RAM);
 #endif
 
-	wmb();
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 
 	/* set default watermark values */
 
@@ -1317,10 +1311,10 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	offset = (lfb->bo) ? lfb->bo->node->start : 0;
 	offset += crtc->y * fb->pitch + crtc->x * ALIGN(fb->bits_per_pixel, 8) / 8;
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	dc_unlock(priv);
 	/* The value programmed takes effect at the next frame scan */
 	write_dc(priv, DC_FB_ST_OFFSET, offset);
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 
 	return ret;
 }
@@ -1401,10 +1395,10 @@ static void lx_crtc_dpms(struct drm_crtc *crtc, int mode) {
 		break;
 	}
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	dc_unlock(priv);
 	write_dc(priv, DC_GENERAL_CFG, gcfg);
 	write_dc(priv, DC_DISPLAY_CFG, dcfg);
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 }
 
 static bool lx_crtc_mode_fixup(struct drm_crtc *crtc,
@@ -1518,7 +1512,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 
 	lfb = to_lx_fb(fb);
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	dc_unlock(priv);
 
 	/* setup hw to use the new fb crtc->fb with scanout starting at (FB-)
 	 * coords (x,y) using crtc->fb->pitch. */
@@ -1690,7 +1684,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 
 	/* TODO: DC_GFX_SCALE */
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 
 	DRM_DEBUG_DRIVER("\n");
 	return 0;
@@ -1719,7 +1713,7 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 
 	m->clock = real_freq;
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	dc_unlock(priv);
 
 	dcfg = read_dc(priv, DC_DISPLAY_CFG);
 	/* timing changes are ignored until this bit is set */
@@ -1780,7 +1774,7 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 
 	/* nothing to do for the VGA emulation block */
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 
 	/* set output format */
 	rdmsr(LX_MSR(LX_VP, LX_GLD_MSR_CONFIG), lo, hi);
@@ -2193,7 +2187,7 @@ static int lx_video_reinit(struct lx_priv *priv, enum lx_video_format vfmt) {
 		break;
 	}
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	dc_unlock(priv);
 
 	write_dc(priv, DC_VID_Y_ST_OFFSET, y->start);
 	if (u)
@@ -2201,7 +2195,7 @@ static int lx_video_reinit(struct lx_priv *priv, enum lx_video_format vfmt) {
 	if (v)
 		write_dc(priv, DC_VID_V_ST_OFFSET, v->start);
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 
 	priv->video_fmt = vfmt;
 
@@ -2327,11 +2321,11 @@ static int lx_map_video_memory(struct drm_device *dev)
 	if (ret)
 		goto failed_map_vp;
 
-	/* need to unlock the MSRs for WR with a magic value */
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	/* need to unlock the MSRs for WR */
+	dc_unlock(priv);
 	/* base address for graphics memory region, alignment: 16MB */
 	write_dc(priv, DC_GLIU0_MEM_OFFSET, priv->vmem_phys & 0xFF000000);
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 
 	DRV_INFO("%lu KB of video memory at linear address 0x%lx\n",
 		 (unsigned long)priv->vmem_size / 1024,
@@ -2566,9 +2560,9 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 
 		if (dc_irq & LX_IRQ_STATUS_MASK) {
 			/* some of DC's IRQ status bits seem to be enabled */
-			write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+			dc_unlock(priv);
 			write_dc(priv, DC_IRQ, dc_irq); /* clear DC IRQ status */
-			write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+			dc_lock(priv);
 		}
 
 		if (gp_irq & LX_IRQ_STATUS_MASK) {
@@ -2608,7 +2602,7 @@ static void lx_irq_enable_vblank(struct drm_device *dev)
 	u32 dc_irq_filt_ctl;
 	u32 dc_irq;
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	dc_unlock(priv);
 
 	/* set line counter */
 	dc_irq_filt_ctl = read_dc(priv, DC_IRQ_FILT_CTL);
@@ -2626,7 +2620,7 @@ static void lx_irq_enable_vblank(struct drm_device *dev)
 	dc_irq &= ~DC_IRQ_MASK;         /* unmask line cnt interrupt */
 	write_dc(priv, DC_IRQ, dc_irq);
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 }
 
 static void lx_irq_disable_vblank(struct drm_device *dev)
@@ -2634,14 +2628,14 @@ static void lx_irq_disable_vblank(struct drm_device *dev)
 	struct lx_priv *priv = dev->dev_private;
 	u32 dc_irq;
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	dc_unlock(priv);
 
 	dc_irq = read_dc(priv, DC_IRQ);
 	dc_irq &= ~LX_IRQ_STATUS_MASK; /* don't clear any interrupt status bits */
 	dc_irq |= DC_IRQ_MASK; /* mask line cnt interrupt */
 	write_dc(priv, DC_IRQ, dc_irq);
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 }
 
 static void lx_driver_irq_preinstall(struct drm_device *dev)
@@ -2650,7 +2644,7 @@ static void lx_driver_irq_preinstall(struct drm_device *dev)
 
 	/* disable all interrupts */
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
+	dc_unlock(priv);
 
 	/* DC: line cnt & vip vsync loss interrupts */
 	write_dc(priv, DC_IRQ, DC_IRQ_MASK | DC_IRQ_VIP_VSYNC_IRQ_MASK);
@@ -2658,7 +2652,7 @@ static void lx_driver_irq_preinstall(struct drm_device *dev)
 	write_gp(priv, GP_INT_CNTRL, GP_INT_IDLE_MASK |
 				     GP_INT_CMD_BUF_EMPTY_MASK);
 
-	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
+	dc_lock(priv);
 }
 
 static int lx_driver_irq_postinstall(struct drm_device *dev)
