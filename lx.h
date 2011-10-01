@@ -27,10 +27,12 @@
 
 /* TODO:
  * - connector / output {DPMS property,subpixel?}
- * - argb-cursor really needs to be 64x64 sized
  * - DRM_MODE_PROP_{IMMUTABLE,RANGE,ENUM}
  * - don't return handle 0 for anything (maybe use for fbcon's fb)
  * - set mode_config.{max_cursor_{width,height},preferred_depth,prefer_shadow}
+ * 
+ * client.c:
+ * - set LUT or disable passing graphics data through gamma RAM
  */
 
 
@@ -83,6 +85,7 @@ enum lx_crtcs {
 	LX_CRTC_VIDEO,
 };
 
+struct lx_priv;
 
 struct lx_bo {
 	struct drm_mm_node *node;
@@ -91,6 +94,8 @@ struct lx_bo {
 	unsigned height;
 	unsigned bpp;
 	unsigned pitch;
+	/* TODO: may need additional 'void *data' param for this function */
+	void (*free)(struct lx_priv *, struct lx_bo *);
 	int id;
 };
 

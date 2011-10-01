@@ -1084,7 +1084,10 @@ static void lx_crtc_gamma_set(struct drm_crtc *crtc, u16 *r, u16 *g, u16 *b,
 	lx_crtc_load_lut(crtc);
 }
 
-/* TODO: need wmb's at least for unlock; wmb; stuff; wmb; lock */
+static void lx_cursor_unset(struct lx_priv *priv, struct lx_bo *bo)
+{
+	priv->crtcs[LX_CRTC_GRAPHIC].cursor_bo = NULL;
+}
 
 static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 			      uint32_t handle, uint32_t width, uint32_t height)
@@ -1167,6 +1170,7 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 	dc_lock(priv);
 
 	lx_crtc->cursor_bo = bo;
+	bo->free = lx_cursor_unset;
 
 	return 0;
 }
@@ -2110,6 +2114,9 @@ static void lx_bo_destroy(struct lx_priv *priv, struct drm_file *file_priv,
 				  bo->id, bo->node->size,
 				  (unsigned long)(bo->node->start + priv->vmem_phys), ret);
 	}
+
+	if (bo->free)
+		bo->free(priv, bo);
 
 	if (bo->node)
 		drm_mm_put_block(bo->node);
