@@ -30,9 +30,17 @@
  * - DRM_MODE_PROP_{IMMUTABLE,RANGE,ENUM}
  * - don't return handle 0 for anything (maybe use for fbcon's fb)
  * - set mode_config.{max_cursor_{width,height},preferred_depth,prefer_shadow}
+ * - xfce: set mode & revert back to the old one sets the old fb but not the
+ *         old mode --
+ *         starting X in mode A, setting mode B, setting mode A fails with
+ *         corrupted fb (mode not set, but fb is)
+ * - see drm's wait_for_page_flip to implement gp_wait_for_idle
  * 
  * client.c:
  * - set LUT or disable passing graphics data through gamma RAM
+ *
+ * modesetting:
+ * - remove dependency on xvmc
  */
 
 
@@ -149,9 +157,11 @@ struct lx_crtc {
 		u8 r;
 	} lut[LX_LUT_SIZE];
 
-	struct lx_bo *cursor_bo;
+	u32 cursor_offset;
+	unsigned cursor_enabled : 1;
+	unsigned cursor_color   : 1;
 
-	unsigned flip_pending : 1;
+	unsigned flip_scheduled : 1;
 };
 
 struct lx_priv;
@@ -462,6 +472,18 @@ enum dc_registers {
 #define DC_DV_CTL_DV_MASK		(1 << 1)
 #define DC_DV_CTL_CLEAR_DV_RAM		(1 << 0)
 
+#define DC_LINE_CNT_DNA			(1 << 31)
+#define DC_LINE_CNT_VNA			(1 << 30)
+#define DC_LINE_CNT_VSA			(1 << 29)
+#define DC_LINE_CNT_FLIP		(1 << 27)
+#define DC_LINE_CNT_V_LINE_CNT_SHIFT	(16)
+#define DC_LINE_CNT_V_LINE_CNT_MASK	(0x7ff << DC_LINE_CNT_V_LINE_CNT_SHIFT)
+#define DC_LINE_CNT_VFLIP		(1 << 15)
+#define DC_LINE_CNT_SIGC		(1 << 14)
+#define DC_LINE_CNT_EVEN_FIELD		(1 << 13)
+#define DC_LINE_CNT_DOT_COUNT_SHIFT	(0)
+#define DC_LINE_CNT_DOT_COUNT_MASK	(0x7ff << DC_LINE_CNT_DOT_COUNT_SHIFT)
+
 #define DC_IRQ_FILT_CTL_INTERLACE_ADDR	(1 << 28)
 #define DC_IRQ_FILT_CTL_ALPHA_FILT_ENA	(1 << 14)
 #define DC_IRQ_FILT_CTL_FILT_ENA	(1 << 12)
@@ -691,12 +713,12 @@ static inline void write_vop(struct lx_priv *priv, int reg, uint32_t val)
 static inline void dc_unlock(struct lx_priv *priv)
 {
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
-	wmb();
+	DRM_WRITEMEMORYBARRIER();
 }
 
 static inline void dc_lock(struct lx_priv *priv)
 {
-	wmb();
+	DRM_WRITEMEMORYBARRIER();
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 }
 

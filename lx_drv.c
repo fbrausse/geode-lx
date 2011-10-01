@@ -37,6 +37,7 @@ static struct {
 	              /* [3:0]  : post scaler divisor (P) */
 	u32 freq_khz; /* resulting dot-freq in kHz when PLL stabilizes */
 } const lx_pll_freq[] = {   /* M+1 N+1 P+1 */
+	/* gap till 15000 */
 	{ 0x31AC,  24923 }, /*   4, 27, 13 */
 	{ 0x215D,  25175 }, /*   3, 22, 14 */
 	{ 0x1087,  27000 }, /*   2,  9,  8 */
@@ -51,27 +52,32 @@ static struct {
 	{ 0x219A,  37889 }, /*   3, 26, 11 */
 	{ 0x2158,  39168 }, /*   3, 22,  9 */
 	{ 0x0045,  40000 }, /*   1,  5,  6 */
+	/* gap */
 	{ 0x0089,  43163 }, /*   1,  9, 10 */
 	{ 0x10E7,  44900 }, /*   2, 15,  8 */
 	{ 0x2136,  45720 }, /*   3, 20,  7 */
 	{ 0x3207,  49500 }, /*   4, 33,  8 */
 	{ 0x2187,  50000 }, /*   3, 25,  8 */
+	/* gap */
 	{ 0x4286,  56250 }, /*   5, 41,  7 */
 	{ 0x10E5,  60650 }, /*   2, 15,  6 */
 	{ 0x4214,  65000 }, /*   5, 34,  5 */
 	{ 0x1105,  68179 }, /*   2, 17,  6 */
+	/* gap */
 	{ 0x31E4,  74250 }, /*   4, 31,  5 */
 	{ 0x3183,  75000 }, /*   4, 25,  4 */
 	{ 0x4284,  78750 }, /*   5, 41,  5 */
 	{ 0x1104,  81600 }, /*   2, 17,  5 */
+	/* gap */
 	{ 0x6363,  94500 }, /*   7, 55,  4 */
 	{ 0x5303,  97520 }, /*   6, 49,  4 */
 	{ 0x2183, 100187 }, /*   3, 25,  4 */
 	{ 0x2122, 101420 }, /*   3, 19,  3 */
-	// { 0x41B1, 106500 }, /*   5, 28,  2 */ /* TODO: wrong, 134.4 MHz */
+	/* gap */
 	{ 0x1081, 108000 }, /*   2,  9,  2 */
 	{ 0x6201, 113310 }, /*   7, 33,  2 */
 	{ 0x0041, 119650 }, /*   1,  5,  2 */
+	/* gap */
 	{ 0x41A1, 129600 }, /*   5, 27,  2 */
 	{ 0x2182, 133500 }, /*   3, 25,  3 */
 	{ 0x41B1, 135000 }, /*   5, 28,  2 */
@@ -82,6 +88,7 @@ static struct {
 	{ 0x0061, 169203 }, /*   1,  7,  2 */
 	{ 0x4231, 172800 }, /*   5, 36,  2 */
 	{ 0x2151, 175500 }, /*   3, 22,  2 */
+	/* gap */
 	{ 0x52E1, 189000 }, /*   6, 47,  2 */
 	{ 0x0071, 192000 }, /*   1,  8,  2 */
 	{ 0x3201, 198000 }, /*   4, 33,  2 */
@@ -90,13 +97,17 @@ static struct {
 	{ 0x7481, 218250 }, /*   8, 73,  2 */
 	{ 0x4170, 229500 }, /*   5, 24,  1 */
 	{ 0x6210, 234000 }, /*   7, 34,  1 */
+	/* gap */
 	{ 0x3140, 251182 }, /*   4, 21,  1 */
 	{ 0x6250, 261000 }, /*   7, 38,  1 */
+	/* gap */
 	{ 0x41C0, 278400 }, /*   5, 29,  1 */
 	{ 0x5220, 280640 }, /*   6, 35,  1 */
 	{ 0x0050, 288000 }, /*   1,  6,  1 */
 	{ 0x41E0, 297000 }, /*   5, 31,  1 */
+	/* gap */
 	{ 0x2130, 320207 }, /*   3, 20,  1 */
+	/* gap */
 	{ 0x6310, 341349 }, /*   7, 50,  1 */
 };
 
@@ -1084,11 +1095,6 @@ static void lx_crtc_gamma_set(struct drm_crtc *crtc, u16 *r, u16 *g, u16 *b,
 	lx_crtc_load_lut(crtc);
 }
 
-static void lx_cursor_unset(struct lx_priv *priv, struct lx_bo *bo)
-{
-	priv->crtcs[LX_CRTC_GRAPHIC].cursor_bo = NULL;
-}
-
 static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 			      uint32_t handle, uint32_t width, uint32_t height)
 {
@@ -1115,7 +1121,7 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 		gcfg = read_dc(priv, DC_GENERAL_CFG);
 		gcfg &= ~DC_GENERAL_CFG_CURE; /* disable hardware cursor */
 
-		lx_crtc->cursor_bo = NULL;
+		lx_crtc->cursor_enabled = false;
 
 		dc_unlock(priv);
 		write_dc(priv, DC_GENERAL_CFG, gcfg);
@@ -1164,13 +1170,14 @@ static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 	/* bo->node->start must always be 32 byte aligned */
 	BUG_ON(bo->node->start & 0x1f);
 
+	lx_crtc->cursor_offset = bo->node->start;
+	lx_crtc->cursor_enabled = true;
+	lx_crtc->cursor_color = !!(gcfg & DC_GENERAL_CFG_CLR_CUR);
+
 	dc_unlock(priv);
-	write_dc(priv, DC_CURS_ST_OFFSET, bo->node->start);
+	write_dc(priv, DC_CURS_ST_OFFSET, lx_crtc->cursor_offset);
 	write_dc(priv, DC_GENERAL_CFG, gcfg);
 	dc_lock(priv);
-
-	lx_crtc->cursor_bo = bo;
-	bo->free = lx_cursor_unset;
 
 	return 0;
 }
@@ -1179,16 +1186,20 @@ static int lx_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
 {
 	struct lx_priv *priv = crtc->dev->dev_private;
 	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
-	struct lx_bo *bo = lx_crtc->cursor_bo;
+	unsigned height = 64;
+	unsigned width = lx_crtc->cursor_color ? 48 : 64;
+	unsigned pitch = width * (lx_crtc->cursor_color ? 32 : 2) / 8;
 
 	if (lx_crtc->id != LX_CRTC_GRAPHIC) {
 		DRM_ERROR("cursor is only supported on the graphics crtc\n");
 		return -EINVAL;
 	}
-	if (!bo) {
-		DRM_DEBUG_DRIVER("ERROR: trying to move non-existant cursor\n");
-		return -EINVAL;
-	}
+	/* a disabled cursor means we don't know whether the values we set here
+	 * are actually valid for a newly set cursor as the width / strides as
+	 * well as the offset to the cursor image of course may differ from the
+	 * last known cursor image (2bpp vs. 32bpp) */
+	if (!lx_crtc->cursor_enabled)
+		DRM_DEBUG_DRIVER("WARNING: moving disabled cursor\n");
 
 	dc_unlock(priv);
 	{
@@ -1200,17 +1211,17 @@ static int lx_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
 			} c;
 			u32 v;
 		} rx = { {
-			.offset = x < 0 ? min_t(u32, -x, bo->width - 1) : 0,
+			.offset = x < 0 ? min_t(u32, -x, width - 1) : 0,
 			.coord  = x < 0 ? 0 : x,
 		} },
 		  ry = { {
-			.offset = y < 0 ? min_t(u32, -y, bo->height - 1) : 0,
+			.offset = y < 0 ? min_t(u32, -y, height - 1) : 0,
 			.coord  = y < 0 ? 0 : y,
 		} };
 
 		/* the cursor offset register must always point to the first
 		 * line to be drawn on the screen */
-		u32 off = bo->node->start + bo->pitch * ry.c.offset;
+		u32 off = lx_crtc->cursor_offset + pitch * ry.c.offset;
 
 		write_dc(priv, DC_CURS_ST_OFFSET, off);
 
@@ -1294,14 +1305,26 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 			 lfb->bo ? (unsigned long)(lfb->bo->node->start + priv->vmem_phys) : 0UL,
 			 lfb->bo ? (unsigned long)(lfb->bo->node->size) : 0UL);
 
+	offset = (lfb->bo) ? lfb->bo->node->start : 0;
+	offset += crtc->y * fb->pitch + crtc->x * ALIGN(fb->bits_per_pixel, 8) / 8;
+
 	/* Abuse the event_lock for protecting the event */
 	spin_lock_irqsave(&priv->ddev->event_lock, flags);
-	if (lx_crtc->flip_pending) {
+
+	/* Check whether a flip has already been scheduled by user-space.
+	 * If so, leave. */
+	if (lx_crtc->flip_scheduled) {
+		/* Another flip is still pending */
 		spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 		return -EBUSY;
 	}
 	lx_crtc->event = event;
-	lx_crtc->flip_pending = 1;
+	lx_crtc->flip_scheduled = true;
+
+	dc_unlock(priv);
+	/* The value programmed takes effect at the next frame scan */
+	write_dc(priv, DC_FB_ST_OFFSET, offset);
+	dc_lock(priv);
 	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 
 	crtc->fb = fb;
@@ -1312,32 +1335,27 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 		lx_crtc->event = NULL;
 	}
 
-	offset = (lfb->bo) ? lfb->bo->node->start : 0;
-	offset += crtc->y * fb->pitch + crtc->x * ALIGN(fb->bits_per_pixel, 8) / 8;
-
-	dc_unlock(priv);
-	/* The value programmed takes effect at the next frame scan */
-	write_dc(priv, DC_FB_ST_OFFSET, offset);
-	dc_lock(priv);
-
 	return ret;
 }
 
 /* called from our IRQ handler to deliver a pending page-flip event */
-static void lx_crtc_do_page_flip(struct drm_crtc *crtc) {
+static void lx_crtc_do_page_flip(struct drm_crtc *crtc)
+{
 	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
 	struct lx_priv *priv = crtc->dev->dev_private;
 	struct drm_pending_vblank_event *e;
 	unsigned long flags;
 
 	spin_lock_irqsave(&priv->ddev->event_lock, flags);
-	if (!lx_crtc->flip_pending) {
+
+	if (!lx_crtc->flip_scheduled) {
 		spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 		return;
 	}
+
 	e = lx_crtc->event;
 	lx_crtc->event = NULL;
-	lx_crtc->flip_pending = 0;
+	lx_crtc->flip_scheduled = false;
 	if (e) {
 		/* wakeup userspace */
 		e->event.sequence = drm_vblank_count(priv->ddev, lx_crtc->id);
@@ -1346,6 +1364,7 @@ static void lx_crtc_do_page_flip(struct drm_crtc *crtc) {
 		list_add_tail(&e->base.link, &e->base.file_priv->event_list);
 		wake_up_interruptible(&e->base.file_priv->event_wait);
 	}
+
 	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 
 	drm_vblank_put(priv->ddev, lx_crtc->id);
@@ -1484,11 +1503,11 @@ enum lx_cursor_status {
 
 static enum lx_cursor_status lx_cursor_status(struct drm_crtc *crtc)
 {
-	struct lx_bo *cursor_bo = to_lx_crtc(crtc)->cursor_bo;
+	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
 
-	if (!crtc->fb || !cursor_bo)
+	if (!lx_crtc->base.fb || !lx_crtc->cursor_enabled)
 		return CURSOR_DISABLED;
-	return cursor_bo->bpp == 2 ? CURSOR_MONOCHROME : CURSOR_COLOR;
+	return lx_crtc->cursor_color ? CURSOR_COLOR : CURSOR_MONOCHROME;
 }
 
 static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
@@ -1501,7 +1520,8 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	u32 gcfg, dcfg, dvctl;
 	u32 gfx_pitch, fb_width, fb_height, line_sz;
 
-	DRM_DEBUG_DRIVER("x: %d, y: %d, old fb: %p\n", x, y, old_fb);
+	DRM_DEBUG_DRIVER("x: %d, y: %d, new fb: %p, old fb: %p\n",
+			 x, y, fb, old_fb);
 
 	priv->pan_x = x;
 	priv->pan_y = y;
@@ -2578,7 +2598,6 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 		}
 	}
 
-
 	if (dc_irq & DC_IRQ_STATUS) {
 		do_gettimeofday(&priv->last_vblank);
 
@@ -2729,9 +2748,6 @@ static int lx_idr_free(int id, void *p, void *data)
 
 static void lx_driver_postclose(struct drm_device *dev, struct drm_file *file)
 {
-	struct lx_priv *priv = dev->dev_private;
-	unsigned i;
-
 	DRM_DEBUG_DRIVER("\n");
 
 	idr_for_each(&file->object_idr, lx_idr_free, file);
