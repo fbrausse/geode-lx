@@ -2738,9 +2738,6 @@ static void lx_driver_postclose(struct drm_device *dev, struct drm_file *file)
 	idr_remove_all(&file->object_idr);
 	idr_destroy(&file->object_idr);
 
-	for (i = 0; i < LX_NUM_CRTCS; i++)
-		priv->crtcs[i].cursor_bo = NULL;
-
 	file->driver_priv = NULL;
 }
 
