@@ -268,14 +268,16 @@ static struct lx_bo * lx_bo_create(struct drm_file *file_priv,
 	if (!bo)
 		return NULL;
 
-	do {
-		if (!idr_pre_get(&file_priv->object_idr, GFP_KERNEL))
-			goto err;
+	if (file_priv) {
+		do {
+			if (!idr_pre_get(&file_priv->object_idr, GFP_KERNEL))
+				goto err;
 
-		spin_lock(&file_priv->table_lock);
-		ret = idr_get_new(&file_priv->object_idr, bo, &bo->id);
-		spin_unlock(&file_priv->table_lock);
-	} while (ret == -EAGAIN);
+			spin_lock(&file_priv->table_lock);
+			ret = idr_get_new(&file_priv->object_idr, bo, &bo->id);
+			spin_unlock(&file_priv->table_lock);
+		} while (ret == -EAGAIN);
+	}
 
 	if (ret == -ENOSPC)
 		goto err;
@@ -293,9 +295,11 @@ static void lx_bo_destroy(struct lx_priv *priv, struct drm_file *file_priv,
 {
 	int ret;
 
-	spin_lock(&file_priv->table_lock);
-	idr_remove(&file_priv->object_idr, bo->id);
-	spin_unlock(&file_priv->table_lock);
+	if (file_priv) {
+		spin_lock(&file_priv->table_lock);
+		idr_remove(&file_priv->object_idr, bo->id);
+		spin_unlock(&file_priv->table_lock);
+	}
 
 	ret = lx_bo_rmmap(priv, bo);
 	if (ret)
@@ -410,7 +414,10 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	struct drm_framebuffer *fb = &lfb->base;
 	struct fb_info *info;
 	struct drm_mode_fb_cmd mode_cmd;
-	unsigned long size;
+	struct drm_mm_node *node;
+	struct lx_bo *bo;
+	unsigned size;
+	unsigned at;
 	int ret;
 #if 0
 	unsigned page_align = 1;
@@ -431,7 +438,33 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	/* allocate backing store */
 	size = mode_cmd.pitch * mode_cmd.height;
-#if 0
+#if 1
+	/* Allocate a chunk from the far end of memory, so the compression
+	 * feature is still available for the more serious users (like X).
+	 * The assumption here is that this code is the first to ever allocate
+	 * something from vmem (which is true since this is called at init
+	 * time). */
+	at = priv->vmem_size - size;
+	node = lx_mm_alloc_at(priv, size, 8, at, 1);
+	if (!node) {
+		DRM_ERROR("error allocating initial fbcon fb at %u, sz: %u\n",
+			  at, size);
+		return -ENOMEM;
+	}
+	bo = lx_bo_create(NULL, node);
+	if (!bo) {
+		DRM_ERROR("error creating bo for initial fbcon fb\n");
+		drm_mm_put_block(node);
+		return -ENOMEM;
+	}
+	ret = lx_bo_addmap(priv, bo);
+	if (ret) {
+		DRM_ERROR("error adding map for initial fbcon fb's bo: %d\n", ret);
+		lx_bo_destroy(priv, NULL, bo);
+		return ret;
+	}
+	drm_core_ioremap_wc(bo->map, priv->ddev);
+#elif 0
 	size = ALIGN(size, PAGE_SIZE);
 	/* TODO: init placement */
 	/* lock vram-mutex */
@@ -451,16 +484,20 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info = framebuffer_alloc(0, &priv->pdev->dev);
 	if (!info) {
 		mutex_unlock(&dev->struct_mutex);
+		drm_core_ioremapfree(bo->map, priv->ddev);
+		lx_bo_destroy(priv, NULL, bo);
 		return -ENOMEM;
 	}
 
 	info->par = helper;
 
-	ret = lx_fb_init(priv, lfb, &mode_cmd, lfb->bo);
+	ret = lx_fb_init(priv, lfb, &mode_cmd, bo);
 	if (ret) {
 		DRM_ERROR("Failed to initialize drm_framebuffer: %d\n", ret);
 		framebuffer_release(info);
 		mutex_unlock(&dev->struct_mutex);
+		drm_core_ioremapfree(bo->map, priv->ddev);
+		lx_bo_destroy(priv, NULL, bo);
 		return ret;
 	}
 
@@ -475,10 +512,9 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->flags = FBINFO_DEFAULT /*| FBINFO_VIRTFB*/;
 	info->fbops = &lx_fb_ops;
 
-	info->fix.smem_start = priv->vmem_phys;
+	info->fix.smem_start = at;
 	info->fix.smem_len = size;
-	/* TODO: use drm_local_map's handle here */
-	info->screen_base = ioremap_wc(priv->vmem_phys, size);
+	info->screen_base = bo->map->handle;
 	info->screen_size = size;
 
 	drm_fb_helper_fill_var(info, helper, sizes->fb_width, sizes->fb_height);
@@ -486,8 +522,8 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->apertures = alloc_apertures(1);
 	DRM_DEBUG_DRIVER("fb aper: %p\n", info->apertures);
 	if (info->apertures) {
-		info->apertures->ranges[0].base = priv->vmem_phys;
-		info->apertures->ranges[0].size = priv->vmem_size;
+		info->apertures->ranges[0].base = at;
+		info->apertures->ranges[0].size = size;
 	}
 
 	ret = fb_alloc_cmap(&info->cmap, 256, 0);
@@ -505,7 +541,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	DRM_INFO("fb mappable at 0x%lx\n",  info->fix.smem_start);
 	DRM_INFO("vram aper   at 0x%lx\n", (unsigned long)priv->vmem_phys);
-	DRM_INFO("size %lu\n", size);
+	DRM_INFO("size %u\n", size);
 	DRM_INFO("fb depth is %d\n", fb->depth);
 	DRM_INFO("   pitch is %d\n", fb->pitch);
 	DRM_INFO("  height is %d\n", fb->height);
@@ -563,13 +599,16 @@ static void lx_fbdev_fini(struct drm_device *dev) {
 		unregister_framebuffer(info);
 		if (info->cmap.len)
 			fb_dealloc_cmap(&info->cmap);
-		iounmap(info->screen_base);
 		framebuffer_release(info);
 	}
 
 	drm_fb_helper_fini(&lfb->helper);
 	drm_framebuffer_cleanup(&lfb->base); /* TODO: don't? */
 
+	if (lfb->bo) {
+		drm_core_ioremapfree(lfb->bo->map, dev);
+		lx_bo_destroy(priv, NULL, lfb->bo);
+	}
 	kfree(lfb);
 	priv->fb = NULL;
 }
