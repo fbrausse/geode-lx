@@ -250,6 +250,11 @@ static int lx_bo_rmmap(struct lx_priv *priv, struct lx_bo *bo)
 	if (!bo->map)
 		return 0;
 
+	if (bo->map->handle) {
+		drm_core_ioremapfree(bo->map, priv->ddev);
+		bo->map->handle = NULL;
+	}
+
 	ret = drm_rmmap(priv->ddev, bo->map);
 	if (ret)
 		return ret;
@@ -438,7 +443,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	/* allocate backing store */
 	size = mode_cmd.pitch * mode_cmd.height;
-#if 1
+
 	/* Allocate a chunk from the far end of memory, so the compression
 	 * feature is still available for the more serious users (like X).
 	 * The assumption here is that this code is the first to ever allocate
@@ -464,27 +469,12 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 		return ret;
 	}
 	drm_core_ioremap_wc(bo->map, priv->ddev);
-#elif 0
-	size = ALIGN(size, PAGE_SIZE);
-	/* TODO: init placement */
-	/* lock vram-mutex */
-	ret = ttm_bo_create(&priv->mman.bdev, size, ttm_bo_type_device,
-			    &placement, page_align, 0, !kernel, NULL, &lxfb->bo);
-	/* unlock vram-mutex */
-	if (ret) {
-		DRM_ERROR("error allocating bo: %d\n", ret);
-		/* TODO: retry */
-		framebuffer_release(info);
-		return ret;
-	}
-#endif
 
 	mutex_lock(&dev->struct_mutex);
 
 	info = framebuffer_alloc(0, &priv->pdev->dev);
 	if (!info) {
 		mutex_unlock(&dev->struct_mutex);
-		drm_core_ioremapfree(bo->map, priv->ddev);
 		lx_bo_destroy(priv, NULL, bo);
 		return -ENOMEM;
 	}
@@ -496,7 +486,6 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 		DRM_ERROR("Failed to initialize drm_framebuffer: %d\n", ret);
 		framebuffer_release(info);
 		mutex_unlock(&dev->struct_mutex);
-		drm_core_ioremapfree(bo->map, priv->ddev);
 		lx_bo_destroy(priv, NULL, bo);
 		return ret;
 	}
@@ -512,7 +501,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->flags = FBINFO_DEFAULT /*| FBINFO_VIRTFB*/;
 	info->fbops = &lx_fb_ops;
 
-	info->fix.smem_start = priv->vmem_phys + at;
+	info->fix.smem_start = bo->map->offset;
 	info->fix.smem_len = size;
 	info->screen_base = bo->map->handle;
 	info->screen_size = size;
@@ -605,10 +594,9 @@ static void lx_fbdev_fini(struct drm_device *dev) {
 	drm_fb_helper_fini(&lfb->helper);
 	drm_framebuffer_cleanup(&lfb->base); /* TODO: don't? */
 
-	if (lfb->bo) {
-		drm_core_ioremapfree(lfb->bo->map, dev);
+	if (lfb->bo)
 		lx_bo_destroy(priv, NULL, lfb->bo);
-	}
+
 	kfree(lfb);
 	priv->fb = NULL;
 }
