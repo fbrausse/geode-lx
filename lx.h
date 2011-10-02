@@ -28,7 +28,7 @@
 /* TODO:
  * - connector / output {DPMS property,subpixel?}
  * - DRM_MODE_PROP_{IMMUTABLE,RANGE,ENUM}
- * - don't return handle 0 for anything (maybe use for fbcon's fb)
+ * - don't return handle 0 for anything
  * - set mode_config.{max_cursor_{width,height},preferred_depth,prefer_shadow}
  * - xfce: set mode & revert back to the old one sets the old fb but not the
  *         old mode --

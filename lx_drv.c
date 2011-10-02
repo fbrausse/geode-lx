@@ -406,6 +406,9 @@ static struct fb_ops lx_fb_ops = {
 	.fb_debug_leave = drm_fb_helper_debug_leave,
 };
 
+/* pitch needs to be aligned to qword boundary */
+#define lx_gfx_pitch_for(width, bpp)	ALIGN((width) * ALIGN((bpp), 8) / 8, 8)
+
 /**
  * @sizes  init params for new fb object
  * @return negative: error, zero: no modes retrieved -> don't use fb,
@@ -424,11 +427,6 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	unsigned size;
 	unsigned at;
 	int ret;
-#if 0
-	unsigned page_align = 1;
-	bool kernel = true;
-	struct ttm_placement placement;
-#endif
 
 	DRM_DEBUG_DRIVER("helper: %p, sizes: %p, priv: %p, fb: %p\n",
 			 helper, sizes, priv, helper->fb);
@@ -439,7 +437,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	mode_cmd.height = sizes->surface_height;
 	mode_cmd.bpp    = sizes->surface_bpp;
 	mode_cmd.depth  = sizes->surface_depth;
-	mode_cmd.pitch  = mode_cmd.width * ALIGN(mode_cmd.bpp, 8) / 8;
+	mode_cmd.pitch  = lx_gfx_pitch_for(mode_cmd.width, mode_cmd.bpp);
 
 	/* allocate backing store */
 	size = mode_cmd.pitch * mode_cmd.height;
@@ -447,26 +445,32 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	/* Allocate a chunk from the far end of memory, so the compression
 	 * feature is still available for the more serious users (like X).
 	 * The assumption here is that this code is the first to ever allocate
-	 * something from vmem (which is true since this is called at init
-	 * time). */
+	 * something from vmem (which is true so far since this is called at
+	 * init time). */
+	if (priv->vmem_size < size) {
+		DRM_ERROR("vmem too small to create fb, need: %u KB, got %u KB; "
+			  "reduce resolution or color depth or increase the "
+			  "size of available Video-RAM (usually in the BIOS)\n",
+			  size >> 10, priv->vmem_size >> 10);
+		return -ENOMEM;
+	}
 	at = priv->vmem_size - size;
 	node = lx_mm_alloc_at(priv, size, 8, at, 1);
 	if (!node) {
-		DRM_ERROR("error allocating initial fbcon fb at %u, sz: %u\n",
+		DRM_ERROR("allocating initial fbcon fb at %u, sz: %u\n",
 			  at, size);
 		return -ENOMEM;
 	}
 	bo = lx_bo_create(NULL, node);
 	if (!bo) {
-		DRM_ERROR("error creating bo for initial fbcon fb\n");
+		DRM_ERROR("creating bo for initial fbcon fb\n");
 		drm_mm_put_block(node);
 		return -ENOMEM;
 	}
 	ret = lx_bo_addmap(priv, bo);
 	if (ret) {
-		DRM_ERROR("error adding map for initial fbcon fb's bo: %d\n", ret);
-		lx_bo_destroy(priv, NULL, bo);
-		return ret;
+		DRM_ERROR("adding map for initial fbcon fb's bo: %d\n", ret);
+		goto err_bo_destroy;
 	}
 	drm_core_ioremap_wc(bo->map, priv->ddev);
 
@@ -474,9 +478,9 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	info = framebuffer_alloc(0, &priv->pdev->dev);
 	if (!info) {
-		mutex_unlock(&dev->struct_mutex);
-		lx_bo_destroy(priv, NULL, bo);
-		return -ENOMEM;
+		DRM_ERROR("allocating fb info\n");
+		ret = -ENOMEM;
+		goto err_unlock0;
 	}
 
 	info->par = helper;
@@ -484,10 +488,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	ret = lx_fb_init(priv, lfb, &mode_cmd, bo);
 	if (ret) {
 		DRM_ERROR("Failed to initialize drm_framebuffer: %d\n", ret);
-		framebuffer_release(info);
-		mutex_unlock(&dev->struct_mutex);
-		lx_bo_destroy(priv, NULL, bo);
-		return ret;
+		goto err_unlock1;
 	}
 
 	/* setup helper */
@@ -509,7 +510,6 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	drm_fb_helper_fill_var(info, helper, sizes->fb_width, sizes->fb_height);
 
 	info->apertures = alloc_apertures(1);
-	DRM_DEBUG_DRIVER("fb aper: %p\n", info->apertures);
 	if (info->apertures) {
 		info->apertures->ranges[0].base = info->fix.smem_start;
 		info->apertures->ranges[0].size = size;
@@ -517,16 +517,13 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	ret = fb_alloc_cmap(&info->cmap, 256, 0);
 	if (ret) {
-		DRM_ERROR("error allocating cmap: %d\n", ret);
+		DRV_INFO("error allocating cmap: %d, ignoring\n", ret);
 		info->cmap.len = 0;
 	}
 
 	mutex_unlock(&dev->struct_mutex);
 
 	/* TODO: init info->pixmap */
-
-	DRM_DEBUG_DRIVER("dev->mode_config.mutex locked: %d\n",
-			 mutex_is_locked(&priv->ddev->mode_config.mutex));
 
 	DRM_INFO("fb mappable at 0x%lx\n",  info->fix.smem_start);
 	DRM_INFO("vram aper   at 0x%lx\n", (unsigned long)priv->vmem_phys);
@@ -538,9 +535,15 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	vga_switcheroo_client_fb_set(priv->pdev, info);
 
-	/* TODO: retrieve enough VMEM space for FB from GEM/TTM, init fb_info
-	 * and return 1 */
 	return 1;
+
+err_unlock1:
+	framebuffer_release(info);
+err_unlock0:
+	mutex_unlock(&dev->struct_mutex);
+err_bo_destroy:
+	lx_bo_destroy(priv, NULL, bo);
+	return ret;
 }
 
 static struct drm_fb_helper_funcs lx_fb_helper_funcs = {
