@@ -2077,18 +2077,24 @@ static void lx_modeset_cleanup(struct drm_device *dev) {
  *   - alignment: 1 MB (via GP's GLD_MSR_CONFIG)
  */
 
-static struct drm_mm_node * lx_mm_alloc(struct lx_priv *priv, unsigned size,
-					unsigned alignment, int best_match)
+static struct drm_mm_node * lx_mm_alloc_at(struct lx_priv *priv, unsigned size,
+					   unsigned alignment, unsigned from,
+					   int best_match)
 {
 	struct drm_mm_node *node;
 
 	/* TODO: do any of these calls need mutex protection? */
-	node = drm_mm_search_free(&priv->mman.mm, size, alignment, best_match);
+	node = drm_mm_search_free_in_range(&priv->mman.mm, size, alignment,
+					   from, priv->vmem_size, best_match);
 	if (node)
-		node = drm_mm_get_block(node, size, alignment);
+		node = drm_mm_get_block_range(node, size, alignment, from,
+					      priv->vmem_size);
 
 	return node;
 }
+
+#define lx_mm_alloc(priv, size, alignment, best_match) \
+	lx_mm_alloc_at((priv), (size), (alignment), 0, (best_match))
 
 static struct lx_bo * lx_bo_create(struct drm_file *file_priv,
 				   struct drm_mm_node *node)
@@ -2309,26 +2315,17 @@ static int lx_map_video_memory(struct drm_device *dev)
 	 * reside in physical RAM */
 	priv->vmem_size = lx_vmem_size();
 
-	ret = -ENOMEM;
-
 	/* todo: mark this region as write-combined (uncacheable)
 	 * (see LX Processor Data Book, Table 5-17, p. 170) */
 
-	/* stolen memory, add priv->vmem_phys to all blocks from this mm */
+	/* stolen memory, add priv->vmem_phys to all blocks from this mm to get
+	 * the linear address
+	 * (mapped by the GLIU0 to the end of the physical RAM) */
 	ret = drm_mm_init(&priv->mman.mm, 0, priv->vmem_size);
 	if (ret) {
 		DRM_ERROR("error initializing memory manager: %d\n", ret);
 		goto failed_mm;
 	}
-
-#if 0
-	ret = drm_addmap(dev, priv->vmem_phys, priv->vmem_size,
-			 _DRM_FRAME_BUFFER, _DRM_DRIVER, &priv->vmem);
-	if (ret) {
-		DRM_ERROR("error mapping vmem: %d\n", ret);
-		goto failed_map_vmem;
-	}
-#endif
 
 	ret = drm_addmap(dev,
 		   pci_resource_start(pdev, 1), pci_resource_len(pdev, 1),
@@ -2365,10 +2362,7 @@ failed_map_vp:
 failed_map_dc:
 	drm_rmmap(dev, priv->gp);
 failed_map_gp:
-#if 0
-	drm_rmmap(dev, priv->vmem);
-failed_map_vmem:
-#endif
+	drm_mm_takedown(&priv->mman.mm);
 failed_mm:
 	i = ARRAY_SIZE(region_names);
 failed_req:
@@ -2386,8 +2380,6 @@ static void lx_unmap_video_memory(struct drm_device *dev)
 	drm_rmmap(dev, priv->vp);
 	drm_rmmap(dev, priv->dc);
 	drm_rmmap(dev, priv->gp);
-	// iounmap(priv->vmem_virt);
-	// drm_rmmap(dev, priv->vmem);
 
 	drm_mm_takedown(&priv->mman.mm);
 
@@ -2395,7 +2387,6 @@ static void lx_unmap_video_memory(struct drm_device *dev)
 	pci_release_region(pdev, 2);
 	pci_release_region(pdev, 1);
 	pci_release_region(pdev, 0);
-	// pci_disable_device(pdev);
 }
 
 static int lx_driver_device_is_agp(struct drm_device *dev)
@@ -2431,7 +2422,6 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags)
 
 	drm_vblank_init(dev, 1 /* TODO: LX_NUM_CRTCS */);
 	drm_irq_install(dev);
-	// lx_driver_enable_vblank(dev, LX_CRTC_GRAPHIC);
 
 	rdmsr(0xa0002001, lo, hi);
 	DRM_DEBUG_DRIVER("GP GLD config: %08x\n", lo);

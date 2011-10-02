@@ -181,8 +181,6 @@ struct lx_priv {
 
 	resource_size_t vmem_phys; /* linear address for framebuffer & off screen memory */
 	resource_size_t vmem_size;
-	// void __iomem *vmem_virt; /* virtual address for framebuffer & off screen memory */
-	// drm_local_map_t *vmem;
 	drm_local_map_t *gp; /* graphics processor regs */
 	drm_local_map_t *dc; /* display controller regs */
 	drm_local_map_t *vp; /* video processor regs */
