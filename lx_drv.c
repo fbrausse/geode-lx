@@ -205,6 +205,82 @@ static int lx_graphic_mode_valid(const struct drm_display_mode *mode,
 	return MODE_OK;
 }
 
+/* --------------------------------------------------------------------------
+ * Buffer objects
+ * -------------------------------------------------------------------------- */
+
+static struct drm_mm_node * lx_mm_alloc_at(struct lx_priv *priv, unsigned size,
+					   unsigned alignment, unsigned from,
+					   int best_match)
+{
+	struct drm_mm_node *node;
+
+	/* TODO: do any of these calls need mutex protection? */
+	node = drm_mm_search_free_in_range(&priv->mman.mm, size, alignment,
+					   from, priv->vmem_size, best_match);
+	if (node)
+		node = drm_mm_get_block_range(node, size, alignment, from,
+					      priv->vmem_size);
+
+	return node;
+}
+
+#define lx_mm_alloc(priv, size, alignment, best_match) \
+	lx_mm_alloc_at((priv), (size), (alignment), 0, (best_match))
+
+static struct lx_bo * lx_bo_create(struct drm_file *file_priv,
+				   struct drm_mm_node *node)
+{
+	struct lx_bo *bo;
+	int ret;
+
+	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
+	if (!bo)
+		return NULL;
+
+	do {
+		if (!idr_pre_get(&file_priv->object_idr, GFP_KERNEL))
+			goto err;
+
+		spin_lock(&file_priv->table_lock);
+		ret = idr_get_new(&file_priv->object_idr, bo, &bo->id);
+		spin_unlock(&file_priv->table_lock);
+	} while (ret == -EAGAIN);
+
+	if (ret == -ENOSPC)
+		goto err;
+
+	bo->node = node;
+	return bo;
+
+err:
+	kfree(bo);
+	return NULL;
+}
+
+static void lx_bo_destroy(struct lx_priv *priv, struct drm_file *file_priv,
+			  struct lx_bo *bo)
+{
+	spin_lock(&file_priv->table_lock);
+	idr_remove(&file_priv->object_idr, bo->id);
+	spin_unlock(&file_priv->table_lock);
+
+	if (bo->map) {
+		int ret = drm_rmmap(priv->ddev, bo->map);
+		if (ret)
+			DRM_ERROR("removing local map for object %d, size: %lu @ %lx; %d\n",
+				  bo->id, bo->node->size,
+				  (unsigned long)(bo->node->start + priv->vmem_phys), ret);
+	}
+
+	if (bo->free)
+		bo->free(priv, bo);
+
+	if (bo->node)
+		drm_mm_put_block(bo->node);
+
+	kfree(bo);
+}
 
 /* --------------------------------------------------------------------------
  * FB
@@ -2076,79 +2152,6 @@ static void lx_modeset_cleanup(struct drm_device *dev) {
  *   - max. size: 16 MB
  *   - alignment: 1 MB (via GP's GLD_MSR_CONFIG)
  */
-
-static struct drm_mm_node * lx_mm_alloc_at(struct lx_priv *priv, unsigned size,
-					   unsigned alignment, unsigned from,
-					   int best_match)
-{
-	struct drm_mm_node *node;
-
-	/* TODO: do any of these calls need mutex protection? */
-	node = drm_mm_search_free_in_range(&priv->mman.mm, size, alignment,
-					   from, priv->vmem_size, best_match);
-	if (node)
-		node = drm_mm_get_block_range(node, size, alignment, from,
-					      priv->vmem_size);
-
-	return node;
-}
-
-#define lx_mm_alloc(priv, size, alignment, best_match) \
-	lx_mm_alloc_at((priv), (size), (alignment), 0, (best_match))
-
-static struct lx_bo * lx_bo_create(struct drm_file *file_priv,
-				   struct drm_mm_node *node)
-{
-	struct lx_bo *bo;
-	int ret;
-
-	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
-	if (!bo)
-		return NULL;
-
-	do {
-		if (!idr_pre_get(&file_priv->object_idr, GFP_KERNEL))
-			goto err;
-
-		spin_lock(&file_priv->table_lock);
-		ret = idr_get_new(&file_priv->object_idr, bo, &bo->id);
-		spin_unlock(&file_priv->table_lock);
-	} while (ret == -EAGAIN);
-
-	if (ret == -ENOSPC)
-		goto err;
-
-	bo->node = node;
-	return bo;
-
-err:
-	kfree(bo);
-	return NULL;
-}
-
-static void lx_bo_destroy(struct lx_priv *priv, struct drm_file *file_priv,
-			  struct lx_bo *bo)
-{
-	spin_lock(&file_priv->table_lock);
-	idr_remove(&file_priv->object_idr, bo->id);
-	spin_unlock(&file_priv->table_lock);
-
-	if (bo->map) {
-		int ret = drm_rmmap(priv->ddev, bo->map);
-		if (ret)
-			DRM_ERROR("removing local map for object %d, size: %lu @ %lx; %d\n",
-				  bo->id, bo->node->size,
-				  (unsigned long)(bo->node->start + priv->vmem_phys), ret);
-	}
-
-	if (bo->free)
-		bo->free(priv, bo);
-
-	if (bo->node)
-		drm_mm_put_block(bo->node);
-
-	kfree(bo);
-}
 
 #if 0
 static int lx_alloc_defaults(struct lx_priv *priv, unsigned cmd_buf_size) {
