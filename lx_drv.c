@@ -419,8 +419,10 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	mutex_lock(&dev->struct_mutex);
 
 	info = framebuffer_alloc(0, &priv->pdev->dev);
-	if (!info)
+	if (!info) {
+		mutex_unlock(&dev->struct_mutex);
 		return -ENOMEM;
+	}
 
 	info->par = helper;
 
@@ -428,6 +430,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	if (ret) {
 		DRM_ERROR("Failed to initialize drm_framebuffer: %d\n", ret);
 		framebuffer_release(info);
+		mutex_unlock(&dev->struct_mutex);
 		return ret;
 	}
 
