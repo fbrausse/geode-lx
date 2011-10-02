@@ -595,7 +595,7 @@ static void lx_fbdev_fini(struct drm_device *dev) {
 	}
 
 	drm_fb_helper_fini(&lfb->helper);
-	drm_framebuffer_cleanup(&lfb->base); /* TODO: don't? */
+	drm_framebuffer_cleanup(&lfb->base);
 
 	if (lfb->bo)
 		lx_bo_destroy(priv, NULL, lfb->bo);
@@ -612,11 +612,9 @@ static struct drm_framebuffer * lx_user_fb_create(struct drm_device *dev,
 	struct lx_fb *lfb;
 	int ret;
 
-	/* see radeon_display.c:
-	 * TODO: lookup ttm object via mode_cmd->handle */
-	 if (!bo) {
-		 DRM_ERROR("object with handle %d doesn't exist\n",
-			   mode_cmd->handle);
+	if (!bo) {
+		DRM_ERROR("object with handle %d doesn't exist\n",
+			  mode_cmd->handle);
 		return ERR_PTR(-ENOENT);
 	}
 
