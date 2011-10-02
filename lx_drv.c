@@ -512,7 +512,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->flags = FBINFO_DEFAULT /*| FBINFO_VIRTFB*/;
 	info->fbops = &lx_fb_ops;
 
-	info->fix.smem_start = at;
+	info->fix.smem_start = priv->vmem_phys + at;
 	info->fix.smem_len = size;
 	info->screen_base = bo->map->handle;
 	info->screen_size = size;
@@ -522,7 +522,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->apertures = alloc_apertures(1);
 	DRM_DEBUG_DRIVER("fb aper: %p\n", info->apertures);
 	if (info->apertures) {
-		info->apertures->ranges[0].base = at;
+		info->apertures->ranges[0].base = info->fix.smem_start;
 		info->apertures->ranges[0].size = size;
 	}
 
@@ -541,7 +541,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	DRM_INFO("fb mappable at 0x%lx\n",  info->fix.smem_start);
 	DRM_INFO("vram aper   at 0x%lx\n", (unsigned long)priv->vmem_phys);
-	DRM_INFO("size %u\n", size);
+	DRM_INFO("size %u (0x%x)\n", size, size);
 	DRM_INFO("fb depth is %d\n", fb->depth);
 	DRM_INFO("   pitch is %d\n", fb->pitch);
 	DRM_INFO("  height is %d\n", fb->height);
