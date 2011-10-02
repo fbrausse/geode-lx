@@ -228,6 +228,36 @@ static struct drm_mm_node * lx_mm_alloc_at(struct lx_priv *priv, unsigned size,
 #define lx_mm_alloc(priv, size, alignment, best_match) \
 	lx_mm_alloc_at((priv), (size), (alignment), 0, (best_match))
 
+static int lx_bo_addmap(struct lx_priv *priv, struct lx_bo *bo)
+{
+	resource_size_t off;
+	int ret;
+
+	if (bo->map)
+		return 0;
+
+	off = bo->node->start + priv->vmem_phys;
+	ret = drm_addmap(priv->ddev, off, bo->node->size, _DRM_FRAME_BUFFER,
+			 _DRM_WRITE_COMBINING | _DRM_DRIVER, &bo->map);
+
+	return ret;
+}
+
+static int lx_bo_rmmap(struct lx_priv *priv, struct lx_bo *bo)
+{
+	int ret;
+
+	if (!bo->map)
+		return 0;
+
+	ret = drm_rmmap(priv->ddev, bo->map);
+	if (ret)
+		return ret;
+
+	bo->map = NULL;
+	return 0;
+}
+
 static struct lx_bo * lx_bo_create(struct drm_file *file_priv,
 				   struct drm_mm_node *node)
 {
@@ -261,17 +291,17 @@ err:
 static void lx_bo_destroy(struct lx_priv *priv, struct drm_file *file_priv,
 			  struct lx_bo *bo)
 {
+	int ret;
+
 	spin_lock(&file_priv->table_lock);
 	idr_remove(&file_priv->object_idr, bo->id);
 	spin_unlock(&file_priv->table_lock);
 
-	if (bo->map) {
-		int ret = drm_rmmap(priv->ddev, bo->map);
-		if (ret)
-			DRM_ERROR("removing local map for object %d, size: %lu @ %lx; %d\n",
-				  bo->id, bo->node->size,
-				  (unsigned long)(bo->node->start + priv->vmem_phys), ret);
-	}
+	ret = lx_bo_rmmap(priv, bo);
+	if (ret)
+		DRM_ERROR("removing local map for object %d, size: %lu @ %lx; %d\n",
+			  bo->id, bo->node->size,
+			  (unsigned long)(bo->node->start + priv->vmem_phys), ret);
 
 	if (bo->free)
 		bo->free(priv, bo);
@@ -450,10 +480,6 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	/* TODO: use drm_local_map's handle here */
 	info->screen_base = ioremap_wc(priv->vmem_phys, size);
 	info->screen_size = size;
-
-	/* TODO: unneeded?
-	memset_io(info->screen_base, 0, size);
-	*/
 
 	drm_fb_helper_fill_var(info, helper, sizes->fb_width, sizes->fb_height);
 
@@ -2801,7 +2827,6 @@ static int lx_driver_dumb_map_offset(struct drm_file *file_priv,
 {
 	struct lx_priv *priv = dev->dev_private;
 	struct lx_bo *bo = idr_find(&file_priv->object_idr, handle);
-	resource_size_t off;
 	int ret;
 
 	DRM_DEBUG_DRIVER("handle: %u, bo: %p\n", handle, bo);
@@ -2809,21 +2834,14 @@ static int lx_driver_dumb_map_offset(struct drm_file *file_priv,
 	if (!bo)
 		return -ENOENT;
 
-	if (bo->map) {
-		off = bo->map->offset;
-	} else {
-		off = bo->node->start + priv->vmem_phys;
-		ret = drm_addmap(dev, off, bo->node->size, _DRM_FRAME_BUFFER,
-				 _DRM_WRITE_COMBINING | _DRM_DRIVER,
-				 &bo->map);
-		if (ret) {
-			DRM_ERROR("unable to add local map for object %d, size: %lu @ %lx\n",
-				  handle, bo->node->size, (unsigned long)off);
-			return ret;
-		}
+	ret = lx_bo_addmap(priv, bo);
+	if (ret) {
+		DRM_ERROR("unable to add local map for object %d, size: %lu\n",
+			  handle, bo->node->size);
+		return ret;
 	}
 
-	*offset = off;
+	*offset = bo->map->offset;
 
 	return 0;
 }
