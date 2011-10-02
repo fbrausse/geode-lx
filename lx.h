@@ -19,28 +19,44 @@
 #define DRV_ERR							\
 	DRM_ERROR
 
-#include <ttm/ttm_bo_api.h>
-#include <ttm/ttm_bo_driver.h>
-#include <ttm/ttm_placement.h>
-#include <ttm/ttm_module.h>
-#include <ttm/ttm_page_alloc.h>
-
 /* TODO:
  * - connector / output {DPMS property,subpixel?}
  * - DRM_MODE_PROP_{IMMUTABLE,RANGE,ENUM}
- * - don't return handle 0 for anything
+ * - don't return (idr-)handle 0 for anything
  * - set mode_config.{max_cursor_{width,height},preferred_depth,prefer_shadow}
- * - xfce: set mode & revert back to the old one sets the old fb but not the
- *         old mode --
- *         starting X in mode A, setting mode B, setting mode A fails with
- *         corrupted fb (mode not set, but fb is)
  * - see drm's wait_for_page_flip to implement gp_wait_for_idle
+ * - use special command buffer packet (from userspace) to wait for gp idle:
+ *   need additional queue that tracks the end offsets of each chunk separated
+ *   by this packet
+ * - save & check maximum framebuffer size in priv due to various restrictions:
+ *   - free vmem size for fb (mandatory)
+ *   - max. downscaling (optional)
+ *   - cmd buffer size (mandatory?)
+ *   - video buffer size(s) (optional?)
+ *   - cursor buffer size (optional?)
+ *   - compressed display buffer size (optional)
+ * - command buffer:
+ *   - check & accept the 4 types of commands
+ *   - allow driver-specific commands by using bits [27:17]
+ *   - check for overlapping areas of subsequent blits and either reschedule or
+ *     wait for gp-idle or reverse direction of the one or the other (or let
+ *     userspace decide which resolution strategy shall be chosen/preferred)
+ *   - additional interface: allow page-grained blits from userspace virtual mem
+ *     - needs page-size to be a multiple of pitch for source buffer(s) when
+ *       spanning multiple (non-contiguous) pages & offset to page-size alignment
+ *       -> mmap'ed buffers only?
+ *   - flush
+ * - video overlay
  * 
  * client.c:
  * - set LUT or disable passing graphics data through gamma RAM
  *
  * modesetting:
  * - remove dependency on xvmc
+ * - xfce: set mode & revert back to the old one sets the old fb but not the
+ *         old mode --
+ *         starting X in mode A, setting mode B, setting mode A fails with
+ *         corrupted fb (mode not set, but fb is)
  */
 
 
@@ -200,10 +216,6 @@ struct lx_priv {
 	unsigned pan_x, pan_y;
 
 	struct lx_mman {
-		struct drm_global_reference mem_global_ref;
-		struct ttm_bo_global_ref bo_global_ref;
-		struct ttm_bo_device bdev;
-
 		struct drm_mm mm;
 	} mman;
 };
@@ -479,8 +491,8 @@ enum dc_registers {
 #define DC_LINE_CNT_VFLIP		(1 << 15)
 #define DC_LINE_CNT_SIGC		(1 << 14)
 #define DC_LINE_CNT_EVEN_FIELD		(1 << 13)
-#define DC_LINE_CNT_DOT_COUNT_SHIFT	(0)
-#define DC_LINE_CNT_DOT_COUNT_MASK	(0x7ff << DC_LINE_CNT_DOT_COUNT_SHIFT)
+#define DC_LINE_CNT_DOT_LINE_CNT_SHIFT	(0)
+#define DC_LINE_CNT_DOT_LINE_CNT_MASK	(0x7ff << DC_LINE_CNT_DOT_LINE_CNT_SHIFT)
 
 #define DC_IRQ_FILT_CTL_INTERLACE_ADDR	(1 << 28)
 #define DC_IRQ_FILT_CTL_ALPHA_FILT_ENA	(1 << 14)
@@ -711,12 +723,10 @@ static inline void write_vop(struct lx_priv *priv, int reg, uint32_t val)
 static inline void dc_unlock(struct lx_priv *priv)
 {
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_UNLOCK);
-	DRM_WRITEMEMORYBARRIER();
 }
 
 static inline void dc_lock(struct lx_priv *priv)
 {
-	DRM_WRITEMEMORYBARRIER();
 	write_dc(priv, DC_UNLOCK, DC_UNLOCK_LOCK);
 }
 

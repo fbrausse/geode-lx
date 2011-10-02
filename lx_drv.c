@@ -451,7 +451,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 		DRM_ERROR("vmem too small to create fb, need: %u KB, got %u KB; "
 			  "reduce resolution or color depth or increase the "
 			  "size of available Video-RAM (usually in the BIOS)\n",
-			  size >> 10, priv->vmem_size >> 10);
+			  size >> 10, (unsigned)(priv->vmem_size >> 10));
 		return -ENOMEM;
 	}
 	at = priv->vmem_size - size;
@@ -1773,12 +1773,15 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 
 	write_dc(priv, DC_DV_TOP, 0); /* TODO: DV-RAM disabled */
 
-	line_sz = (fb->width * ((fb->bits_per_pixel + 7) / 8) + 7) / 8;
+	/* #qwords to transfer per scanline */
+	line_sz = ALIGN(fb->width * ALIGN(fb->bits_per_pixel, 8) / 8, 8) / 8;
+	BUG_ON(line_sz >= 1024);
 	write_dc(priv, DC_LINE_SIZE, /* in qwords */
 		 0 << 20 /* TODO: video, align 4 */ |
 		 0 << 10 /* TODO: compressed buffer, val+1, val <= 65 */ |
 		 line_sz << 0); /* frame buffer */
 
+	/* pitch in qwords */
 	gfx_pitch = fb->pitch / 8;
 	write_dc(priv, DC_GFX_PITCH, 0 << 16 /* TODO */ | gfx_pitch << 0);
 
@@ -1799,17 +1802,17 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 
 	/* DV-RAM Control */
 	/* ALIGN shouldn't be necessary as the linear memory address is always
-	 * aligned to PAGE_SIZE >= 4096, but it's not like mode-setting were
-	 * critical wrt speed */
+	 * aligned to PAGE_SIZE >= 4096 */
 	dvctl = ALIGN(priv->vmem_phys, 4096);
+	 /* TODO: + offset from MSR_GLIU_P2D_RO0 */
 
-	if (fb->width < 1024) {
+	if (line_sz < 128) {
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_1K;
-	} else if (fb->width < 2048) {
+	} else if (line_sz < 256) {
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_2K;
-	} else if (fb->width < 4096) {
+	} else if (line_sz < 512) {
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_4K;
-	} else if (fb->width < 8192) {
+	} else { /* line_sz < 1024 */
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_8K;
 	}
 
@@ -2178,10 +2181,8 @@ static void lx_modeset_cleanup(struct drm_device *dev) {
 
 
 /* The following memory regions should be usable (see DC_GLIU0_MEM_OFFSET, all
- * within a single 16 MB sized, 1 MB aligned memory region):
+ * within a single 256 MB sized, 16 MB aligned memory region):
  * uncompressed frame buffer:
- *   - size dictated by resolution / depth
- *     (max. 44.2 MB for 1920x1440x32 using 1/2 scaling filter, 11 MB w/o filter ... nah, that's wrong)
  *   - max. size: 2048x2048, 32 bpp (w/ and w/o scaling filter as it only
  *     supports scaling when width <= 1024 and also only supports max. 2:1
  *     downscaling)
@@ -2190,15 +2191,16 @@ static void lx_modeset_cleanup(struct drm_device *dev) {
  * compressed display buffer (optional):
  *   - max. 64+4 qwords per line written to memory = 544 bytes per line
  *   - max. framebuffer height: 2048
- *   - max. vertical downscaling: up to, but excluding 2:1
+ *   - max. vertical downscaling: up to, but excluding 2:1 (w/o filter)
+ *     (TODO: does scaling really come into play here?)
  *   -> max. 4095 lines of framebuffer data need to be compressed
  *   -> max. 4095 * 544 = 2227680 bytes of compressed buffer size needed
  *                      = 2176 KB - 544 byte
  *   -> so take 2176 KB for the compressed framebuffer
- * cursor buffer (optional):
+ * cursor buffer (optional) (union):
  *   -  2bpp: 64x64-2  ->  1 KB
  *   - 32bpp: 64x48-32 -> 12 KB
- * video buffer(s):
+ * video buffer(s) (union):
  *   - YUV-4:2:0:
  *     - 1920 + 960 + 960
  *   - YUV-4:2:2:
@@ -2355,11 +2357,7 @@ static int lx_map_video_memory(struct drm_device *dev)
 	struct lx_priv *priv = dev->dev_private;
 	unsigned i;
 	int ret;
-/*
-	ret = pci_enable_device(pdev);
-	if (ret)
-		return ret;
-*/
+
 	for (i=0; i<ARRAY_SIZE(region_names); i++) {
 		ret = pci_request_region(pdev, i, region_names[i]);
 		if (ret) {
@@ -2428,7 +2426,6 @@ failed_mm:
 failed_req:
 	while (i--)
 		pci_release_region(pdev, i);
-	// pci_disable_device(pdev);
 	return ret;
 }
 
@@ -2558,9 +2555,9 @@ static int lx_driver_unload(struct drm_device *dev)
  */
 static int lx_get_scanout_vpos(struct lx_priv *priv)
 {
-	int v = read_dc(priv, DC_LINE_CNT);
-	int w = read_dc(priv, DC_LINE_CNT);
-	return (v == w) ? v : -EAGAIN;
+	u32 v = read_dc(priv, DC_LINE_CNT);
+	u32 w = read_dc(priv, DC_LINE_CNT);
+	return (v == w) ? v & DC_LINE_CNT_DOT_LINE_CNT_MASK : -EAGAIN;
 }
 
 /**
@@ -2649,12 +2646,16 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 	}
 
 	if (dc_irq & DC_IRQ_STATUS) {
+		/* programmed line counter value (0) has been reached by the DC,
+		 * so the beginning of the scanout buffer */
+
+		/* need to get the timestamp first as the do_page_flip code may
+		 * already depend on it to send back to userspace */
 		do_gettimeofday(&priv->last_vblank);
 
 		/* process possibly pending page flip */
 		lx_crtc_do_page_flip(&priv->crtcs[LX_CRTC_GRAPHIC].base);
 
-		/* programmed line counter value (0) has been reached */
 		drm_handle_vblank(dev, LX_CRTC_GRAPHIC);
 		ret = IRQ_HANDLED;
 	}
