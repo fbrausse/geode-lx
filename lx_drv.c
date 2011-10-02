@@ -397,7 +397,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	mode_cmd.height = sizes->surface_height;
 	mode_cmd.bpp    = sizes->surface_bpp;
 	mode_cmd.depth  = sizes->surface_depth;
-	mode_cmd.pitch  = mode_cmd.width * ALIGN(mode_cmd.bpp, 8);
+	mode_cmd.pitch  = mode_cmd.width * ALIGN(mode_cmd.bpp, 8) / 8;
 
 	/* allocate backing store */
 	size = mode_cmd.pitch * mode_cmd.height;
