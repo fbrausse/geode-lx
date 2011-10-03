@@ -270,9 +270,11 @@ static bool lx_cmd_buffer_empty(struct lx_priv *priv)
 	return read_gp(priv, GP_CMD_READ) == read_gp(priv, GP_CMD_WRITE);
 }
 
-static inline void lx_cmd_commit_locked(struct lx_priv *priv)
+static void lx_cmd_commit_locked(struct lx_priv *priv)
 {
-	write_gp(priv, GP_CMD_WRITE, priv->cmd_start + priv->cmd_write);
+	struct drm_mm_node *node = priv->cmd_buf_node;
+
+	write_gp(priv, GP_CMD_WRITE, node->start + priv->cmd_write);
 }
 
 static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
@@ -281,7 +283,7 @@ static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
 
 	priv->cmd_buf[wr] = data;
 
-	if (++wr >= priv->cmd_size)
+	if (++wr >= priv->cmd_buf_node->size)
 		wr = 0;
 
 	priv->cmd_write = wr;
@@ -292,16 +294,16 @@ static void lx_cmd_write_locked(struct lx_priv *priv, u32 *data,
 				unsigned length)
 {
 	unsigned wr = priv->cmd_write;
-	unsigned left = priv->cmd_size - wr;
-	u32 *buf = priv->cmd_buf;
+	unsigned left = priv->cmd_buf_node->size - wr;
+	u32 __iomem *buf = priv->cmd_buf;
 
 	if (length > left) {
-		memcpy(buf + wr, data, left * 4);
+		memcpy_toio(buf + wr, data, left * 4);
 		length -= left;
 		data += left;
 		wr = 0;
 	}
-	memcpy(buf + wr, data, length * 4);
+	memcpy_toio(buf + wr, data, length * 4);
 	wr += length;
 
 	priv->cmd_write = wr;

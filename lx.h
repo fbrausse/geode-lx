@@ -220,10 +220,9 @@ struct lx_priv {
 	} mman;
 
 	spinlock_t cmd_lock; /* protects cmd_write */
-	u32 cmd_start, cmd_size; /* start and final offset of the cmd buffer in
-	                         * dwords from the cmd buffer origin */
+	struct drm_mm_node *cmd_buf_node;
 	u32 cmd_write; /* index into cmd_buf */
-	u32 *cmd_buf;
+	u32 __iomem *cmd_buf;
 };
 
 enum lx_cmd_type {
