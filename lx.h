@@ -500,6 +500,7 @@ enum dc_registers {
 
 #define DC_DV_TOP_DV_TOP_EN		(1 << 0)
 
+#define DC_DV_CTL_DV_OFF_MASK		0xfffff000
 #define DC_DV_CTL_DV_LINE_SIZE_MASK	(3 << 10)
 #define DC_DV_CTL_DV_LINE_SIZE_1K	(0 << 10) /* in bytes */
 #define DC_DV_CTL_DV_LINE_SIZE_2K	(1 << 10)

@@ -1647,6 +1647,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	}
 
 	lfb = to_lx_fb(fb);
+	BUG_ON(!lfb->bo);
 
 	dc_unlock(priv);
 
@@ -1733,12 +1734,9 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	write_dc(priv, DC_ARB_CFG, 0);
 
 	/* bits [2:0] are added to the pixel panning offset after next vsync */
-	/* The framebuffer space always starts at offset 0 from GLIU0_MEM_OFFSET
-	 * because that way the compression may be enabled, which is unavailable
-	 * otherwise. */
-	offset = (lfb->bo) ? lfb->bo->node->start : 0;
-	offset += y * fb->pitch + x * ((fb->bits_per_pixel + 7) / 8);
-	DRM_DEBUG_DRIVER("fb offset: %x\n", offset);
+	/* If this value is != 0, framebuffer compression is unavailable */
+	offset = lfb->bo->node->start;
+	offset += y * fb->pitch + x * ALIGN(fb->bits_per_pixel, 8) / 8;
 	write_dc(priv, DC_FB_ST_OFFSET, offset);
 
 	/* TODO: write compressed buffer offset */
@@ -1781,33 +1779,38 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	 * reminder that:
 	 * a) DV snoops the memory controller, not the DC where it's located,
 	 *    so the real physical memory addresses are needed, not the linear
-	 *    we use everywhere else
+	 *    ones we use everywhere else
 	 * b) another address may be entered here, to snoop on any other memory
-	 *    range
-	 * c) TODO: don't do this when ~priv->vmem_phys == 0 (uninitialized) */
-	dvctl = ALIGN(priv->vmem_phys, 4096);
+	 *    range */
+	/* TODO: module param to disable dv-ram */
+	if (~priv->vmem_phys) {
+		/* got the real physical address, so let's write it and don't
+		 * trust the BIOS */
+		dvctl = ALIGN(priv->vmem_phys, 4096);
+	} else {
+		/* no phys addess, either trust the BIOS or have no DV-RAM */
+		dvctl = read_dc(priv, DC_DV_CTL) & DC_DV_CTL_DV_OFF_MASK;
+	}
 
-	if (line_sz < 128) {
+	if (line_sz < 128)
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_1K;
-	} else if (line_sz < 256) {
+	else if (line_sz < 256)
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_2K;
-	} else if (line_sz < 512) {
+	else if (line_sz < 512)
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_4K;
-	} else { /* line_sz < 1024 */
+	else /* line_sz < 1024 */
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_8K;
-	}
 
-	if (fb->height <= 512) {
+	if (fb->height <= 512)
 		dvctl |= DC_DV_CTL_DV_RANGE_512;
-	} else if (fb->height <= 1024) {
+	else if (fb->height <= 1024)
 		dvctl |= DC_DV_CTL_DV_RANGE_1024;
-	} else if (fb->height <= 1536) {
+	else if (fb->height <= 1536)
 		dvctl |= DC_DV_CTL_DV_RANGE_1536;
-	} else if (fb->height <= 2048) {
+	else if (fb->height <= 2048)
 		dvctl |= DC_DV_CTL_DV_RANGE_2048;
-	}
 
-	if (fb->width < 8192 && fb->height <= 2048 &&
+	if (fb->width < 8192 && fb->height <= 2048 && offset == 0 &&
 	    lx_compression_enabled(priv)) {
 		/* mark DV-RAM as dirty & invalid */
 		dvctl |= DC_DV_CTL_CLEAR_DV_RAM;
@@ -1816,12 +1819,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 		dvctl |= DC_DV_CTL_DV_MASK;
 	}
 
-#if 0 /* don't overwrite offset as set by the BIOS */
 	write_dc(priv, DC_DV_CTL, dvctl);
-#else
-	/* disable RAM snooping */
-	write_dc(priv, DC_DV_CTL, read_dc(priv, DC_DV_CTL) | DC_DV_CTL_DV_MASK);
-#endif
 
 	/* TODO: DC_GFX_SCALE */
 
