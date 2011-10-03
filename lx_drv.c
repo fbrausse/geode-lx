@@ -582,7 +582,8 @@ static int lx_fbdev_init(struct drm_device *dev)
 	return 0;
 }
 
-static void lx_fbdev_fini(struct drm_device *dev) {
+static void lx_fbdev_fini(struct drm_device *dev)
+{
 	struct lx_priv *priv = dev->dev_private;
 	struct lx_fb *lfb = priv->fb;
 	struct fb_info *info = lfb->helper.fbdev;
@@ -604,9 +605,10 @@ static void lx_fbdev_fini(struct drm_device *dev) {
 	priv->fb = NULL;
 }
 
-static struct drm_framebuffer * lx_user_fb_create(struct drm_device *dev,
-						  struct drm_file *file_priv,
-						  struct drm_mode_fb_cmd *mode_cmd)
+static struct drm_framebuffer *
+lx_user_fb_create(struct drm_device *dev,
+		  struct drm_file *file_priv,
+		  struct drm_mode_fb_cmd *mode_cmd)
 {
 	struct lx_bo *bo = idr_find(&file_priv->object_idr, mode_cmd->handle);
 	struct lx_fb *lfb;
