@@ -226,6 +226,17 @@ extern int  lx_ddc_init(struct drm_device *dev);
 extern void lx_ddc_cleanup(struct drm_device *dev);
 
 
+
+/* in 256 bytes */
+/* DC_GENERAL_CFG */
+#define DISP_PRIO_HIGH_END		0xb /* FIFO high prio end threshold */
+#define DISP_PRIO_HIGH_START		0x6 /* FIFO high prio start threshold */
+/* in 64 bytes */
+/* DC_DISPLAY_CFG */
+#define VID_OVL_PRIO_HIGH_END		0xb
+#define VID_OVL_PRIO_HIGH_START		0x6
+
+
 #define LX_DOTPLL_MINKHZ		15000
 #define LX_MODE_MAX_VFREQ		100    /* in Hz */
 #define LX_MODE_FREQ_TOL		4000   /* in kHz */

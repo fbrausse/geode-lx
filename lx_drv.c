@@ -1621,34 +1621,13 @@ static bool lx_video_overlay_enabled(struct drm_crtc *crtc) {
 	return false;
 }
 
-enum lx_cursor_status {
-	CURSOR_DISABLED,
-	CURSOR_MONOCHROME,
-	CURSOR_COLOR,
-};
-
-/* in 256 bytes */
-#define DISP_PRIO_HIGH_END		0xb /* FIFO high prio end threshold */
-#define DISP_PRIO_HIGH_START		0x6 /* FIFO high prio start threshold */
-/* in 64 bytes */
-#define VID_OVL_PRIO_HIGH_END		0xb
-#define VID_OVL_PRIO_HIGH_START		0x6
-
-static enum lx_cursor_status lx_cursor_status(struct drm_crtc *crtc)
-{
-	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
-
-	if (!lx_crtc->base.fb || !lx_crtc->cursor_enabled)
-		return CURSOR_DISABLED;
-	return lx_crtc->cursor_color ? CURSOR_COLOR : CURSOR_MONOCHROME;
-}
-
 static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 				 struct drm_framebuffer *old_fb)
 {
 	struct lx_priv *priv = crtc->dev->dev_private;
 	struct drm_framebuffer *fb = crtc->fb;
 	struct lx_fb *lfb;
+	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
 	int offset, atomic = 0;
 	u32 gcfg, dcfg, dvctl;
 	u32 gfx_pitch, fb_width, fb_height, line_sz;
@@ -1700,19 +1679,15 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	if (lx_video_overlay_enabled(crtc))
 		gcfg |= DC_GENERAL_CFG_VIDE;
 
-	switch (lx_cursor_status(crtc)) {
-	case CURSOR_DISABLED:
+	/* hardware cursor settings */
+	if (!lx_crtc->cursor_enabled)
 		gcfg &= ~DC_GENERAL_CFG_CURE;
-		break;
-	case CURSOR_MONOCHROME:
+	else
 		gcfg |= DC_GENERAL_CFG_CURE;
+	if (!lx_crtc->cursor_color)
 		gcfg &= ~DC_GENERAL_CFG_CLR_CUR;
-		break;
-	case CURSOR_COLOR:
-		gcfg |= DC_GENERAL_CFG_CURE;
+	else
 		gcfg |= DC_GENERAL_CFG_CLR_CUR;
-		break;
-	}
 
 	write_dc(priv, DC_GENERAL_CFG, gcfg);
 
