@@ -205,6 +205,78 @@ static int lx_graphic_mode_valid(const struct drm_display_mode *mode,
 	return MODE_OK;
 }
 
+#define GP_CMD_PKT_WE				(1 << 31)
+#define GP_CMD_PKT_TYPE_SHIFT			(29)
+#define GP_CMD_PKT_TYPE_MASK			(3 << 29)
+#define GP_CMD_PKT_TYPE_DATA			(3 << 29)
+#define GP_CMD_PKT_TYPE_LUT_LOAD		(2 << 29)
+#define GP_CMD_PKT_TYPE_VECTOR			(1 << 29)
+#define GP_CMD_PKT_TYPE_BLT			(0 << 29)
+#define GP_CMD_PKT_STALL			(1 << 28)
+
+#define GP_CMD_DTYPE_SHIFT			(29)
+#define GP_CMD_DTYPE_MASK			(7 << 29)
+#define GP_CMD_DTYPE_PAT_DATA			(3 << 29)
+#define GP_CMD_DTYPE_PAT_COLORS_2_TO_5		(2 << 29)
+#define GP_CMD_DTYPE_SRC_TO_CH3			(1 << 29)
+#define GP_CMD_DTYPE_SRC_TO_SRC_CH		(0 << 29)
+#define GP_CMD_DCOUNT_MASK			(0x0001ffff)
+
+static int lx_cmd_check(u32 *pkt, unsigned *length)
+{
+	static const u8 pkt_payload[] = { 17, 13, 1, 0 };
+
+	unsigned type = pkt[0] & GP_CMD_PKT_TYPE_MASK;
+	unsigned len  = pkt_payload[type];
+	unsigned left = *length;
+	unsigned dtype, dcount;
+
+	if (left < 1 + len)
+		return -LX_CMD_SHORT;
+
+	if (!(pkt[0] & ((1 << len) - 1)))
+		return -LX_CMD_FAULT; /* empty command */
+
+	if (type == GP_CMD_PKT_TYPE_DATA && (pkt[0] & GP_CMD_PKT_STALL))
+		return -LX_CMD_FAULT; /* data only cmd may not stall */
+
+	left -= 1 + len;
+	pkt  += 1 + len;
+
+	if (type != GP_CMD_PKT_TYPE_VECTOR) {
+		if (left < 1)
+			return -LX_CMD_SHORT
+
+		/* TODO: meh, not quite right ... */
+		switch (pkt[0] & GP_CMD_DTYPE_MASK) {
+		case GP_CMD_DTYPE_SRC_TO_SRC_CH:
+		case GP_CMD_DTYPE_SRC_TO_CH3:
+			if (type != GP_CMD_PKT_TYPE_BLT &&
+			    type != GP_CMD_PKT_TYPE_DATA)
+				return -LX_CMD_FAULT;
+			break;
+		case GP_CMD_DTYPE_PAT_COLORS_2_TO_5:
+		case GP_CMD_DTYPE_PAT_DATA:
+			if (type != GP_CMD_PKT_TYPE_LUT_LOAD &&
+			    type != GP_CMD_PKT_TYPE_DATA)
+				return -LX_CMD_FAULT;
+			break;
+		default:
+			return -LX_CMD_FAULT;
+		}
+
+		dcount = pkt[0] & GP_CMD_DCOUNT_MASK;
+		if (left < 1 + dcount)
+			return -LX_CMD_SHORT;
+
+		left -= 1 + dcount;
+		pkt  += 1 + dcount;
+	}
+
+	*length = left;
+	return 0;
+}
+
 /* --------------------------------------------------------------------------
  * Buffer objects
  * -------------------------------------------------------------------------- */
