@@ -270,26 +270,26 @@ static bool lx_cmd_buffer_empty(struct lx_priv *priv)
 	return read_gp(priv, GP_CMD_READ) == read_gp(priv, GP_CMD_WRITE);
 }
 
-/* TODO: these need locking */
-
-static inline void lx_cmd_commit(struct lx_priv *priv)
+static inline void lx_cmd_commit_locked(struct lx_priv *priv)
 {
 	write_gp(priv, GP_CMD_WRITE, priv->cmd_write);
 }
 
-static inline void lx_cmd_write32(struct lx_priv *priv, u32 data)
+static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
 {
 	unsigned wr = priv->cmd_write;
+
+	priv->cmd_buf[wr] = data;
 
 	if (++wr == priv->cmd_end)
 		wr = 0;
 
-	priv->cmd_buf[wr] = data;
 	priv->cmd_write = wr;
 }
 
 /* length is in dwords */
-static void lx_cmd_write(struct lx_priv *priv, u32 *data, unsigned length)
+static void lx_cmd_write_locked(struct lx_priv *priv, u32 *data,
+				unsigned length)
 {
 	unsigned left = priv->cmd_end - priv->cmd_write;
 	unsigned wr = priv->cmd_write;
@@ -335,11 +335,11 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 
 	spin_lock(&priv->cmd_lock);
 
-	lx_cmd_write(priv, (u32 *)cmd, size / 4);
+	lx_cmd_write_locked(priv, (u32 *)cmd, size / 4);
 	if (post)
-		lx_cmd_write(priv, post_data, post->dcount);
+		lx_cmd_write_locked(priv, post_data, post->dcount);
 
-	lx_cmd_commit(priv);
+	lx_cmd_commit_locked(priv);
 
 	if (cmd->head.wrap)
 		priv->cmd_write = 0;
