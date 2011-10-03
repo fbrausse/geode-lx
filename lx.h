@@ -219,10 +219,22 @@ struct lx_priv {
 		struct drm_mm mm;
 	} mman;
 
-	/* TODO: these need protection by a spinlock */
+	spinlock_t cmd_lock; /* protects cmd_write */
 	u32 cmd_end, cmd_write;
 	u32 *cmd_buf;
 };
+
+enum lx_cmd_type {
+	LX_CMD_TYPE_BLT,
+	LX_CMD_TYPE_VEC,
+	LX_CMD_TYPE_LUT,
+	LX_CMD_TYPE_DATA
+};
+
+#define CMD_DTYPE_SRC_TO_SRC_CH			0
+#define CMD_DTYPE_SRC_TO_CH3			1
+#define CMD_DTYPE_PAT_COLORS_2_TO_5		2
+#define CMD_DTYPE_LUT_COL_PATTERN_DATA		3
 
 struct lx_cmd_post {
 	u32 dcount : 17;
@@ -283,6 +295,8 @@ union lx_cmd {
 		struct lx_cmd_post post;
 	} data;
 };
+
+#define lx_cmd_type(cmd)	((enum lx_cmd_type)(cmd)->head.type)
 
 /* part of lx_i2c.c */
 extern bool lx_ddc_probe(struct i2c_adapter *ddc);

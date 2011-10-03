@@ -1,5 +1,5 @@
 ifneq ($(KERNELVERSION),)
-	ccflags-y += -Iinclude/drm -Wall -g
+	ccflags-y += -Iinclude/drm -Wall
 	obj-m := lx.o
 	lx-y := lx_drv.o lx_i2c.o
 else

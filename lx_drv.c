@@ -205,23 +205,7 @@ static int lx_graphic_mode_valid(const struct drm_display_mode *mode,
 	return MODE_OK;
 }
 
-#define GP_CMD_PKT_WE				(1 << 31)
-#define GP_CMD_PKT_TYPE_SHIFT			(29)
-#define GP_CMD_PKT_TYPE_MASK			(3 << 29)
-#define GP_CMD_PKT_TYPE_DATA			(3 << 29)
-#define GP_CMD_PKT_TYPE_LUT_LOAD		(2 << 29)
-#define GP_CMD_PKT_TYPE_VECTOR			(1 << 29)
-#define GP_CMD_PKT_TYPE_BLT			(0 << 29)
-#define GP_CMD_PKT_STALL			(1 << 28)
-
-#define GP_CMD_DTYPE_SHIFT			(29)
-#define GP_CMD_DTYPE_MASK			(7 << 29)
-#define GP_CMD_DTYPE_PAT_DATA			(3 << 29)
-#define GP_CMD_DTYPE_PAT_COLORS_2_TO_5		(2 << 29)
-#define GP_CMD_DTYPE_SRC_TO_CH3			(1 << 29)
-#define GP_CMD_DTYPE_SRC_TO_SRC_CH		(0 << 29)
-#define GP_CMD_DCOUNT_MASK			(0x0001ffff)
-
+#if 0
 #define LX_CMD_FAULT				1
 #define LX_CMD_SHORT				2
 
@@ -279,6 +263,7 @@ static int lx_cmd_check(u32 *pkt, unsigned *length)
 	*length = left;
 	return 0;
 }
+#endif
 
 static bool lx_cmd_buffer_empty(struct lx_priv *priv)
 {
@@ -301,6 +286,65 @@ static inline void lx_cmd_write32(struct lx_priv *priv, u32 data)
 
 	priv->cmd_buf[wr] = data;
 	priv->cmd_write = wr;
+}
+
+/* length is in dwords */
+static void lx_cmd_write(struct lx_priv *priv, u32 *data, unsigned length)
+{
+	unsigned left = priv->cmd_end - priv->cmd_write;
+	unsigned wr = priv->cmd_write;
+	u32 *buf = priv->cmd_buf;
+
+	if (length > left) {
+		memcpy(buf + wr, data, left * 4);
+		length -= left;
+		data += left;
+		wr = 0;
+	}
+	memcpy(buf + wr, data, length * 4);
+	wr += length;
+
+	priv->cmd_write = wr;
+}
+
+static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
+			   u32 *post_data)
+{
+	struct lx_cmd_post *post = NULL;
+	unsigned size;
+
+	switch (lx_cmd_type(cmd)) {
+	case LX_CMD_TYPE_BLT:
+		size = sizeof(cmd->blt);
+		post = &cmd->blt.post;
+		break;
+	case LX_CMD_TYPE_VEC:
+		size = sizeof(cmd->vec);
+		break;
+	case LX_CMD_TYPE_LUT:
+		size = sizeof(cmd->lut);
+		post = &cmd->lut.post;
+		break;
+	case LX_CMD_TYPE_DATA:
+		size = sizeof(cmd->data);
+		post = &cmd->data.post;
+		break;
+	}
+
+	BUG_ON((!post) ^ (!post_data));
+
+	spin_lock(&priv->cmd_lock);
+
+	lx_cmd_write(priv, (u32 *)cmd, size / 4);
+	if (post)
+		lx_cmd_write(priv, post_data, post->dcount);
+
+	lx_cmd_commit(priv);
+
+	if (cmd->head.wrap)
+		priv->cmd_write = 0;
+
+	spin_unlock(&priv->cmd_lock);
 }
 
 /* --------------------------------------------------------------------------
