@@ -272,7 +272,7 @@ static bool lx_cmd_buffer_empty(struct lx_priv *priv)
 
 static inline void lx_cmd_commit_locked(struct lx_priv *priv)
 {
-	write_gp(priv, GP_CMD_WRITE, priv->cmd_write);
+	write_gp(priv, GP_CMD_WRITE, priv->cmd_start + priv->cmd_write);
 }
 
 static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
@@ -281,7 +281,7 @@ static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
 
 	priv->cmd_buf[wr] = data;
 
-	if (++wr == priv->cmd_end)
+	if (++wr >= priv->cmd_size)
 		wr = 0;
 
 	priv->cmd_write = wr;
@@ -291,8 +291,8 @@ static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
 static void lx_cmd_write_locked(struct lx_priv *priv, u32 *data,
 				unsigned length)
 {
-	unsigned left = priv->cmd_end - priv->cmd_write;
 	unsigned wr = priv->cmd_write;
+	unsigned left = priv->cmd_size - wr;
 	u32 *buf = priv->cmd_buf;
 
 	if (length > left) {

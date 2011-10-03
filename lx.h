@@ -220,7 +220,9 @@ struct lx_priv {
 	} mman;
 
 	spinlock_t cmd_lock; /* protects cmd_write */
-	u32 cmd_end, cmd_write;
+	u32 cmd_start, cmd_size; /* start and final offset of the cmd buffer in
+	                         * dwords from the cmd buffer origin */
+	u32 cmd_write; /* index into cmd_buf */
 	u32 *cmd_buf;
 };
 
@@ -296,6 +298,7 @@ union lx_cmd {
 	} data;
 };
 
+/* let the compiler help: scream when a command type is unhandled */
 #define lx_cmd_type(cmd)	((enum lx_cmd_type)(cmd)->head.type)
 
 /* part of lx_i2c.c */
