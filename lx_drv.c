@@ -236,7 +236,7 @@ static int lx_bo_addmap(struct lx_priv *priv, struct lx_bo *bo)
 	if (bo->map)
 		return 0;
 
-	off = bo->node->start + priv->vmem_phys;
+	off = bo->node->start + priv->vmem_addr;
 	ret = drm_addmap(priv->ddev, off, bo->node->size, _DRM_FRAME_BUFFER,
 			 _DRM_WRITE_COMBINING | _DRM_DRIVER, &bo->map);
 
@@ -310,7 +310,7 @@ static void lx_bo_destroy(struct lx_priv *priv, struct drm_file *file_priv,
 	if (ret)
 		DRM_ERROR("removing local map for object %d, size: %lu @ %lx; %d\n",
 			  bo->id, bo->node->size,
-			  (unsigned long)(bo->node->start + priv->vmem_phys), ret);
+			  (unsigned long)(bo->node->start + priv->vmem_addr), ret);
 
 	if (bo->free)
 		bo->free(priv, bo);
@@ -526,7 +526,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	/* TODO: init info->pixmap */
 
 	DRM_INFO("fb mappable at 0x%lx\n",  info->fix.smem_start);
-	DRM_INFO("vram aper   at 0x%lx\n", (unsigned long)priv->vmem_phys);
+	DRM_INFO("vram aper   at 0x%lx\n", (unsigned long)priv->vmem_addr);
 	DRM_INFO("size %u (0x%x)\n", size, size);
 	DRM_INFO("fb depth is %d\n", fb->depth);
 	DRM_INFO("   pitch is %d\n", fb->pitch);
@@ -1432,10 +1432,10 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 
 	DRM_DEBUG_DRIVER("pipe: %d, old fb: %p, bo @ %lx, size: %lu; new fb: %p, bo @ %lx, size: %lu\n",
 			 event->pipe, crtc->fb,
-			 crtc->fb && lfb2->bo ? (unsigned long)(lfb2->bo->node->start + priv->vmem_phys) : 0UL,
+			 crtc->fb && lfb2->bo ? (unsigned long)(lfb2->bo->node->start + priv->vmem_addr) : 0UL,
 			 crtc->fb && lfb2->bo ? (unsigned long)(lfb2->bo->node->size) : 0UL,
 			 fb,
-			 lfb->bo ? (unsigned long)(lfb->bo->node->start + priv->vmem_phys) : 0UL,
+			 lfb->bo ? (unsigned long)(lfb->bo->node->start + priv->vmem_addr) : 0UL,
 			 lfb->bo ? (unsigned long)(lfb->bo->node->size) : 0UL);
 
 	offset = (lfb->bo) ? lfb->bo->node->start : 0;
@@ -1742,7 +1742,6 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	write_dc(priv, DC_FB_ST_OFFSET, offset);
 
 	/* TODO: write compressed buffer offset */
-	/* TODO: write cursor buffer offset */
 	/* TODO: write video (Y|U|V) buffers' offsets */
 	/* TODO: possibly enable & write DV_TOP_ADDR */
 
@@ -1776,10 +1775,17 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	/* TODO: video downscaling */
 
 	/* DV-RAM Control */
-	/* ALIGN shouldn't be necessary as the linear memory address is always
-	 * aligned to PAGE_SIZE >= 4096 */
+
+	/* initializing this value is strictly speaking unnecessary due to the
+	 * BIOS that should already have initialized it, but it serves as a
+	 * reminder that:
+	 * a) DV snoops the memory controller, not the DC where it's located,
+	 *    so the real physical memory addresses are needed, not the linear
+	 *    we use everywhere else
+	 * b) another address may be entered here, to snoop on any other memory
+	 *    range
+	 * c) TODO: don't do this when ~priv->vmem_phys == 0 (uninitialized) */
 	dvctl = ALIGN(priv->vmem_phys, 4096);
-	 /* TODO: + offset from MSR_GLIU_P2D_RO0 */
 
 	if (line_sz < 128) {
 		dvctl |= DC_DV_CTL_DV_LINE_SIZE_1K;
@@ -2113,7 +2119,7 @@ static void lx_modeset_init(struct drm_device *dev) {
 	dev->mode_config.max_width = 1920;
 	dev->mode_config.max_height = 1440;
 	dev->mode_config.funcs = &lx_mode_funcs;
-	dev->mode_config.fb_base = priv->vmem_phys;
+	dev->mode_config.fb_base = priv->vmem_addr;
 
 	/* TODO: create & attach drm_device specific drm props */
 
@@ -2286,37 +2292,67 @@ err:
 }
 #endif
 
-/* from lxfb_ops.c */
-static unsigned int lx_vmem_size(void)
+/**
+ * Determines the size of the stolen memory region in system memory and -
+ * optionally - it's physical location (on the LX).
+ */
+/* originally from lxfb_ops.c, modified */
+static bool lx_determine_vmem(resource_size_t *vmem_size,
+			      resource_size_t *vmem_phys)
 {
 	unsigned int val;
+#if 0
+	if (cs5535_has_vsa2()) {
+		/* The frame buffer size is reported by a VSM in VSA II */
+		/* Virtual Register Class    = 0x02                     */
+		/* VG_MEM_SIZE (1MB units)   = 0x00                     */
 
-	if (!cs5535_has_vsa2()) {
-		uint32_t hi, lo;
+		outw(VSA_VR_UNLOCK, VSA_VRC_INDEX);
+		outw(VSA_VR_MEM_SIZE, VSA_VRC_INDEX);
+
+		val = (unsigned int)(inw(VSA_VRC_DATA)) & 0xFE;
+
+		*vmem_size = (val << 20);
+	} else
+#endif
+	{
+		unsigned msr;
+		uint32_t n_p2d_ro, hi, lo;
+		uint32_t pdid, pmin, pmax, poffset;
+
+		/* find number of P2D RO registers programmed */
+		rdmsr(MSR_GLIU0_PHY_CAP, lo, hi);
+		n_p2d_ro = (lo & 0x00fc0000) >> 18;
+
+		/* iterate through all valid P2D RO registers that remap an
+		 * arbitrary (page-grained) range of memory accesses by adding
+		 * (in 32 bit sense, so w/ overflow) poffset to it */
+		for (msr = 0; msr < n_p2d_ro; msr++) {
+			rdmsr(MSR_GLIU0_P2D_RO_0 + msr, lo, hi);
+			pdid = hi >> 29;
+			/* got a range remapping to the memory controller, this
+			 * just has to be our framebuffer */
+			if (pdid == LX_GLIU0_DID_GLMC)
+				break;
+		}
+		if (msr == n_p2d_ro)
+			return false;
+
+		poffset = (hi & 0x0fffff00) >> 8;
+		pmax = ((hi & 0xff) << 12) | ((lo & 0xfff00000) >> 20);
+		pmin = (lo & 0x000fffff);
+
+		val = (pmax - pmin) + 1;
 
 		/* The number of pages is (PMAX - PMIN)+1 */
-		/* TODO: this is not quite right: there are more regs than just RO0 */
-		rdmsr(MSR_GLIU_P2D_RO0, lo, hi);
-
-		/* PMAX */
-		val = ((hi & 0xff) << 12) | ((lo & 0xfff00000) >> 20);
-		/* PMIN */
-		val -= (lo & 0x000fffff);
-		val += 1;
-
 		/* The page size is 4k */
-		return (val << 12);
+		*vmem_size = (val << 12);
+		/* address all memory accesses between pmin and pmax (incl) get
+		 * remapped to */
+		*vmem_phys = ((pmin + poffset) << 12) & 0xffffffff;
 	}
 
-	/* The frame buffer size is reported by a VSM in VSA II */
-	/* Virtual Register Class    = 0x02                     */
-	/* VG_MEM_SIZE (1MB units)   = 0x00                     */
-
-	outw(VSA_VR_UNLOCK, VSA_VRC_INDEX);
-	outw(VSA_VR_MEM_SIZE, VSA_VRC_INDEX);
-
-	val = (unsigned int)(inw(VSA_VRC_DATA)) & 0xFE;
-	return (val << 20);
+	return true;
 }
 
 static int lx_map_video_memory(struct drm_device *dev)
@@ -2328,6 +2364,7 @@ static int lx_map_video_memory(struct drm_device *dev)
 		"lx-vp", /* video processor MSRs */
 		/* the unused BAR 4 points to MSRs for the video input port */
 	};
+	char tmp[24];
 	struct pci_dev *pdev = dev->pdev;
 	struct lx_priv *priv = dev->dev_private;
 	unsigned i;
@@ -2341,12 +2378,20 @@ static int lx_map_video_memory(struct drm_device *dev)
 		}
 	}
 
-	priv->vmem_phys = pci_resource_start(pdev, 0); /* physical address */
-	/* rather I/O address, since this space really lies in the RAM, the
-	 * mapping is done via MSR_GLIU_P2D_RO0 */
+	priv->vmem_addr = pci_resource_start(pdev, 0); /* I/O linear address */
+	/* this space really lies in the RAM, the mapping is done via
+	 * MSR_GLIU_P2D_RO0 */
 	/* pci_resource_len(pdev, 0) is wrong. only half this amount seems to
 	 * reside in physical RAM */
-	priv->vmem_size = lx_vmem_size();
+	priv->vmem_phys = ~(resource_size_t)0; /* uninitialized, not aligned */
+	if (!lx_determine_vmem(&priv->vmem_size, &priv->vmem_phys)) {
+		DRM_ERROR("failed to determining size (and physical location) "
+			  "of video memory\n");
+		/* TODO: provide vmem module param
+		 * TODO: continue startup, just w/o DV-RAM and mandatory vmem arg */
+		ret = -ENOMEM; /* really _no_ memory :) */
+		goto failed_mm;
+	}
 
 	/* todo: mark this region as write-combined (uncacheable)
 	 * (see LX Processor Data Book, Table 5-17, p. 170) */
@@ -2381,12 +2426,19 @@ static int lx_map_video_memory(struct drm_device *dev)
 	/* need to unlock the MSRs for WR */
 	dc_unlock(priv);
 	/* base address for graphics memory region, alignment: 16MB */
-	write_dc(priv, DC_GLIU0_MEM_OFFSET, priv->vmem_phys & 0xFF000000);
+	write_dc(priv, DC_GLIU0_MEM_OFFSET, priv->vmem_addr & 0xFF000000);
 	dc_lock(priv);
 
-	DRV_INFO("%lu KB of video memory at linear address 0x%lx\n",
+	if (~priv->vmem_phys)
+		snprintf(tmp, sizeof(tmp), "0x%lx",
+			 (unsigned long)priv->vmem_phys);
+	tmp[sizeof(tmp)-1] = '\0';
+
+	DRV_INFO("%lu KB of video memory at linear address 0x%lx, physical "
+	         "address: %s\n",
 		 (unsigned long)priv->vmem_size / 1024,
-		 (unsigned long)priv->vmem_phys);
+		 (unsigned long)priv->vmem_addr,
+		 ~priv->vmem_phys ? tmp : "unknown");
 
 	return 0;
 

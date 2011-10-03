@@ -195,7 +195,8 @@ struct lx_priv {
 	struct drm_device *ddev;
 	struct pci_dev *pdev;
 
-	resource_size_t vmem_phys; /* linear address for framebuffer & off screen memory */
+	resource_size_t vmem_phys; /* physical memory address of the stolen vmem region */
+	resource_size_t vmem_addr; /* I/O linear address for framebuffer & off screen memory */
 	resource_size_t vmem_size;
 	drm_local_map_t *gp; /* graphics processor regs */
 	drm_local_map_t *dc; /* display controller regs */
@@ -252,13 +253,28 @@ extern void lx_ddc_cleanup(struct drm_device *dev);
 #define LX_IRQ_STATUS_SHIFT		16
 #define LX_IRQ_STATUS_MASK		(~0U << LX_IRQ_STATUS_SHIFT)
 
-/* These form the upper six bytes of the MSR address for the respective
+/* These form the upper six bits of the MSR address for the respective
  * component for outgoing r/w requests from the CPU core */
 #define LX_MC				0x20 /* memory controller */
 #define LX_GLCP				0x4c /* GeodeLink control processor */
 #define LX_VP				0x48 /* video processor */
 #define LX_GP				0xa0 /* graphics processor */
 #define LX_MSR(gldev, adr)		((gldev) << 24 | (adr & 0xffff))
+
+/* used in GLIU P2D descriptors */
+#define LX_GLIU0_DID_GLIU		0
+#define LX_GLIU0_DID_GLMC		1
+#define LX_GLIU0_DID_GLIU1		2
+#define LX_GLIU0_DID_CPU_CORE		3
+#define LX_GLIU0_DID_DC			4
+#define LX_GLIU0_DID_GP			5
+#define LX_GLIU1_DID_GLIU		0
+#define LX_GLIU1_DID_GLIU0		1
+#define LX_GLIU1_DID_VP			2
+#define LX_GLIU1_DID_GLCP		3
+#define LX_GLIU1_DID_GLPCI		4
+#define LX_GLIU1_DID_VIP		5
+#define LX_GLIU1_DID_SB			6
 
 /* addresses for all GeodeLink devices */
 #define LX_GLD_MSR_CAP			0x2000
@@ -271,6 +287,10 @@ extern void lx_ddc_cleanup(struct drm_device *dev);
 #define MSR_VP_DIAG			LX_MSR(LX_VP  , 0x2010)
 #define MSR_GLCP_DAC			LX_MSR(LX_GLCP, 0x0023)
 #define MSR_DC_SPARE_MSR		0x80000011
+
+#define MSR_GLIU0_PHY_CAP		0x10000086
+#define MSR_GLIU0_P2D_RO_0		0x10000029
+#define MSR_GLIU0_P2D_RO_MAX		0x1000002b
 
 #define MSR_GLCP_DOTPLL_HI_DIV4		(1 << 16)
 
