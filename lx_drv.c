@@ -222,6 +222,9 @@ static int lx_graphic_mode_valid(const struct drm_display_mode *mode,
 #define GP_CMD_DTYPE_SRC_TO_SRC_CH		(0 << 29)
 #define GP_CMD_DCOUNT_MASK			(0x0001ffff)
 
+#define LX_CMD_FAULT				1
+#define LX_CMD_SHORT				2
+
 static int lx_cmd_check(u32 *pkt, unsigned *length)
 {
 	static const u8 pkt_payload[] = { 17, 13, 1, 0 };
@@ -245,7 +248,7 @@ static int lx_cmd_check(u32 *pkt, unsigned *length)
 
 	if (type != GP_CMD_PKT_TYPE_VECTOR) {
 		if (left < 1)
-			return -LX_CMD_SHORT
+			return -LX_CMD_SHORT;
 
 		/* TODO: meh, not quite right ... */
 		switch (pkt[0] & GP_CMD_DTYPE_MASK) {
@@ -275,6 +278,29 @@ static int lx_cmd_check(u32 *pkt, unsigned *length)
 
 	*length = left;
 	return 0;
+}
+
+static bool lx_cmd_buffer_empty(struct lx_priv *priv)
+{
+	return read_gp(priv, GP_CMD_READ) == read_gp(priv, GP_CMD_WRITE);
+}
+
+/* TODO: these need locking */
+
+static inline void lx_cmd_commit(struct lx_priv *priv)
+{
+	write_gp(priv, GP_CMD_WRITE, priv->cmd_write);
+}
+
+static inline void lx_cmd_write32(struct lx_priv *priv, u32 data)
+{
+	unsigned wr = priv->cmd_write;
+
+	if (++wr == priv->cmd_end)
+		wr = 0;
+
+	priv->cmd_buf[wr] = data;
+	priv->cmd_write = wr;
 }
 
 /* --------------------------------------------------------------------------

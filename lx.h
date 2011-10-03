@@ -218,6 +218,70 @@ struct lx_priv {
 	struct lx_mman {
 		struct drm_mm mm;
 	} mman;
+
+	/* TODO: these need protection by a spinlock */
+	u32 cmd_end, cmd_write;
+	u32 *cmd_buf;
+};
+
+struct lx_cmd_post {
+	u32 dcount : 17;
+	u32 reserved : 12;
+	u32 dtype : 3;
+};
+
+union lx_cmd {
+	struct lx_cmd_head {
+		u32 write_enables : 28;
+		u32 stall : 1;
+		u32 type : 2;
+		u32 wrap : 1;
+	} head;
+	struct lx_cmd_blt {
+		struct lx_cmd_head head;
+		u32 raster_mode;
+		u32 dst_offset;
+		u32 src_offset;
+		u32 stride;
+		u32 wid_height;
+		u32 src_color_fg;
+		u32 src_color_bg;
+		u32 pat_color_0;
+		u32 pat_color_1;
+		u32 pat_data_0;
+		u32 pat_data_1;
+		u32 ch3_offset;
+		u32 ch3_mode_str;
+		u32 ch3_widhi;
+		u32 base_offset;
+		u32 blt_mode;
+		struct lx_cmd_post post;
+	} blt;
+	struct lx_cmd_vec {
+		struct lx_cmd_head head;
+		u32 raster_mode;
+		u32 dst_offset;
+		u32 vec_err;
+		u32 stride;
+		u32 vec_len;
+		u32 src_color_fg;
+		u32 pat_color_0;
+		u32 pat_color_1;
+		u32 pat_data_0;
+		u32 pat_data_1;
+		u32 ch3_mode_str;
+		u32 base_offset;
+		u32 vector_mode;
+	} vec;
+	struct lx_cmd_lut {
+		struct lx_cmd_head head;
+		u32 lut_index;
+		struct lx_cmd_post post;
+	} lut;
+	struct lx_cmd_data {
+		struct lx_cmd_head head;
+		struct lx_cmd_post post;
+	} data;
 };
 
 /* part of lx_i2c.c */
