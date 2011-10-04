@@ -362,6 +362,33 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
  * Buffer objects
  * -------------------------------------------------------------------------- */
 
+/* this one (and drm_mm_hole_node_start) should really be public ... */
+static inline unsigned long _drm_mm_hole_node_end(struct drm_mm_node *hole_node)
+{
+	struct drm_mm_node *next_node =
+		list_entry(hole_node->node_list.next, struct drm_mm_node,
+			   node_list);
+
+	return next_node->start;
+}
+
+static struct drm_mm_node * lx_mm_alloc_end(struct lx_priv *priv, unsigned size,
+					    unsigned alignment, int best_match)
+{
+	struct drm_mm_node *node;
+
+	node = drm_mm_search_free(&priv->mman.mm, size, alignment, best_match);
+
+	if (node) {
+		unsigned at = _drm_mm_hole_node_end(node) - size;
+		at -= at % alignment;
+		node = drm_mm_get_block_range(node, size, alignment,
+					      at, at + size);
+	}
+
+	return node;
+}
+
 static struct drm_mm_node * lx_mm_alloc_at(struct lx_priv *priv, unsigned size,
 					   unsigned alignment, unsigned from,
 					   int best_match)
@@ -643,7 +670,7 @@ static struct fb_ops lx_fb_ops = {
 	.owner = THIS_MODULE,
 	.fb_check_var = drm_fb_helper_check_var,
 	.fb_set_par = drm_fb_helper_set_par,
-	.fb_fillrect = lx_fillrect,
+	.fb_fillrect = cfb_fillrect,
 	.fb_copyarea = cfb_copyarea,
 	.fb_imageblit = cfb_imageblit,
 	.fb_pan_display = drm_fb_helper_pan_display,
@@ -672,7 +699,6 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	struct drm_mm_node *node;
 	struct lx_bo *bo;
 	unsigned size;
-	unsigned at;
 	int ret;
 
 	DRM_DEBUG_DRIVER("helper: %p, sizes: %p, priv: %p, fb: %p\n",
@@ -694,18 +720,12 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	 * The assumption here is that this code is the first to ever allocate
 	 * something from vmem (which is true so far since this is called at
 	 * init time). */
-	if (priv->vmem_size < size) {
-		DRM_ERROR("vmem too small to create fb, need: %u KB, got %u KB; "
+	node = lx_mm_alloc_end(priv, size, 8, 1);
+	if (!node) {
+		DRM_ERROR("vmem too small to create fb, need: %u KB for fbcon; "
 			  "reduce resolution or color depth or increase the "
 			  "size of available Video-RAM (usually in the BIOS)\n",
-			  size >> 10, (unsigned)(priv->vmem_size >> 10));
-		return -ENOMEM;
-	}
-	at = priv->vmem_size - size;
-	node = lx_mm_alloc_at(priv, size, 8, at, 1);
-	if (!node) {
-		DRM_ERROR("allocating initial fbcon fb at %u, sz: %u\n",
-			  at, size);
+			  size >> 10);
 		return -ENOMEM;
 	}
 	bo = lx_bo_create(NULL, node);
