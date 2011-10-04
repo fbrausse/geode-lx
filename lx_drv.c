@@ -341,10 +341,10 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 	if (post && post->dcount)
 		lx_cmd_write_locked(priv, post_data, post->dcount);
 
-	lx_cmd_commit_locked(priv);
-
 	if (cmd->head.wrap)
 		priv->cmd_write = 0;
+
+	lx_cmd_commit_locked(priv);
 
 	spin_unlock(&priv->cmd_lock);
 }
