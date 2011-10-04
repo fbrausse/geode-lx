@@ -267,7 +267,7 @@ static int lx_cmd_check(u32 *pkt, unsigned *length)
 
 static bool lx_cmd_buffer_empty(struct lx_priv *priv)
 {
-	return read_gp(priv, GP_CMD_READ) == read_gp(priv, GP_CMD_WRITE);
+	return !!(read_gp(priv, GP_BLT_STATUS) & GP_BLT_STATUS_CE);
 }
 
 static void lx_cmd_commit_locked(struct lx_priv *priv)
@@ -2622,6 +2622,52 @@ static bool lx_determine_vmem(resource_size_t *vmem_size,
 	return true;
 }
 
+static int lx_command_ring_init(struct lx_priv *priv, unsigned size)
+{
+	struct drm_mm_node *node;
+	u32 lo, hi;
+
+	node = lx_mm_alloc_end(priv, size, 1 << 20, 1);
+	if (!node)
+		return -ENOMEM;
+
+	priv->cmd_buf = ioremap(node->start + priv->vmem_addr, size);
+	priv->cmd_buf_node = node;
+	priv->cmd_write = 0;
+
+	rdmsr(LX_MSR(LX_GP, LX_GLD_MSR_CONFIG), lo, hi);
+	DRM_DEBUG_DRIVER("old GP's GLD_MSR_CONFIG: %08x_%08x\n", hi, lo);
+	DRV_INFO("command buffer addresses: lin @ 0x%08lx, virt @ 0x%08lx, "
+		 "size: %u KB\n",
+		 (unsigned long)(node->start + priv->vmem_addr),
+		 (unsigned long)priv->cmd_buf,
+		 size >> 10);
+	lo &= ~0x0fff0000;
+	lo |= (priv->vmem_addr >> 4) & 0x0fff0000;
+	wrmsr(LX_MSR(LX_GP, LX_GLD_MSR_CONFIG), lo, hi);
+
+	write_gp(priv, GP_CMD_TOP, node->start);
+	write_gp(priv, GP_CMD_BOT, node->start + size - 1);
+	write_gp(priv, GP_CMD_READ, node->start);
+
+	spin_lock_init(&priv->cmd_lock);
+
+	return 0;
+}
+
+static void lx_command_ring_fini(struct lx_priv *priv)
+{
+	if (priv->cmd_buf) {
+		iounmap(priv->cmd_buf);
+		priv->cmd_buf = NULL;
+	}
+
+	if (priv->cmd_buf_node) {
+		drm_mm_put_block(priv->cmd_buf_node);
+		priv->cmd_buf_node = NULL;
+	}
+}
+
 static int lx_map_video_memory(struct drm_device *dev)
 {
 	static const char *region_names[] = {
@@ -2690,7 +2736,7 @@ static int lx_map_video_memory(struct drm_device *dev)
 	if (ret)
 		goto failed_map_vp;
 
-	/* need to unlock the MSRs for WR */
+	/* need to unlock the regs for WR */
 	dc_unlock(priv);
 	/* base address for graphics memory region, alignment: 16MB */
 	write_dc(priv, DC_GLIU0_MEM_OFFSET, priv->vmem_addr & 0xFF000000);
@@ -2707,8 +2753,14 @@ static int lx_map_video_memory(struct drm_device *dev)
 		 (unsigned long)priv->vmem_addr,
 		 ~priv->vmem_phys ? tmp : "unknown");
 
+	ret = lx_command_ring_init(priv, 2 << 20);
+	if (ret)
+		DRV_INFO("failed initializing command ring of size %u KB\n",
+			 2 << 10);
+
 	return 0;
 
+failed_init_cmd:
 failed_map_vp:
 	drm_rmmap(dev, priv->dc);
 failed_map_dc:
@@ -2727,6 +2779,8 @@ static void lx_unmap_video_memory(struct drm_device *dev)
 {
 	struct pci_dev *pdev = dev->pdev;
 	struct lx_priv *priv = dev->dev_private;
+
+	lx_command_ring_fini(priv);
 
 	drm_rmmap(dev, priv->vp);
 	drm_rmmap(dev, priv->dc);
