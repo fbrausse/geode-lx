@@ -183,7 +183,7 @@ struct lx_crtc {
 struct lx_priv;
 
 #define to_lx_fb(fb)		container_of(fb, struct lx_fb, base)
-#define helper_to_lx_fb(helper)	container_of(helper, struct lx_fb, helper)
+#define helper_to_lx_fb(hlpr)	container_of(hlpr, struct lx_fb, helper)
 struct lx_fb {
 	struct drm_framebuffer base;
 	struct drm_fb_helper helper;
@@ -244,12 +244,15 @@ struct lx_cmd_post {
 };
 
 union lx_cmd {
-	struct lx_cmd_head {
-		u32 write_enables : 28;
-		u32 stall : 1;
-		u32 type : 2;
-		u32 wrap : 1;
-	} head;
+	struct {
+		struct lx_cmd_head {
+			u32 write_enables : 28;
+			u32 stall : 1;
+			u32 type : 2;
+			u32 wrap : 1;
+		} head;
+		u32 body[0];
+	};
 	struct lx_cmd_blt {
 		struct lx_cmd_head head;
 		u32 raster_mode;
@@ -370,8 +373,10 @@ extern void lx_ddc_cleanup(struct drm_device *dev);
 enum gp_registers {
 	GP_DST_OFFSET = 0,
 	GP_SRC_OFFSET,
+	GP_VEC_ERR = GP_SRC_OFFSET, /* alias */
 	GP_STRIDE,
 	GP_WID_HEIGHT,
+	GP_VEC_LEN = GP_WID_HEIGHT, /* alias */
 
 	GP_SRC_COLOR_FG,
 	GP_SRC_COLOR_BG,
@@ -435,6 +440,94 @@ enum gp_registers {
 #define GP_INT_CMD_BUF_EMPTY_STATUS	(1 << 16)
 #define GP_INT_IDLE_MASK		(1 << 1)
 #define GP_INT_CMD_BUF_EMPTY_MASK	(1 << 0)
+
+static const u8 lx_cmd_blt_regids[] = {
+	[GP_RASTER_MODE]	=  0,
+	[GP_DST_OFFSET]		=  1,
+	[GP_SRC_OFFSET]		=  2,
+	[GP_STRIDE]		=  3,
+	[GP_WID_HEIGHT]		=  4,
+	[GP_SRC_COLOR_FG]	=  5,
+	[GP_SRC_COLOR_BG]	=  6,
+	[GP_PAT_COLOR_0]	=  7,
+	[GP_PAT_COLOR_1]	=  8,
+	[GP_PAT_DATA_0]		=  9,
+	[GP_PAT_DATA_1]		= 10,
+	[GP_CH3_OFFSET]		= 11,
+	[GP_CH3_MODE_STR]	= 12,
+	[GP_CH3_WIDHI]		= 13,
+	[GP_BASE_OFFSET]	= 14,
+	[GP_BLT_MODE]		= 15,
+};
+
+static const u8 lx_cmd_vec_regids[] = {
+	[GP_RASTER_MODE]	=  0,
+	[GP_DST_OFFSET]		=  1,
+	[GP_VEC_ERR]		=  2,
+	[GP_STRIDE]		=  3,
+	[GP_VEC_LEN]		=  4,
+	[GP_SRC_COLOR_FG]	=  5,
+	[GP_PAT_COLOR_0]	=  6,
+	[GP_PAT_COLOR_1]	=  7,
+	[GP_PAT_DATA_0]		=  8,
+	[GP_PAT_DATA_1]		=  9,
+	[GP_CH3_MODE_STR]	= 10,
+	[GP_BASE_OFFSET]	= 11,
+	[GP_VECTOR_MODE]	= 12
+};
+
+enum {
+	LX_CMD_POST = ~0U
+};
+
+static inline int lx_cmd_get_regoff(union lx_cmd *cmd, unsigned reg)
+{
+	if (reg == LX_CMD_POST) {
+		struct lx_cmd_post *post;
+
+		/* compiler won't optimize lx_cmd_type() here ... why ever */
+		switch (cmd->head.type) {
+		case LX_CMD_TYPE_BLT:
+			post = &cmd->blt.post;
+			break;
+		case LX_CMD_TYPE_VEC:
+			return -1;
+		case LX_CMD_TYPE_LUT:
+			post = &cmd->lut.post;
+			break;
+		case LX_CMD_TYPE_DATA:
+			post = &cmd->data.post;
+			break;
+		}
+
+		return (u32 *)post - cmd->body;
+	} else {
+		switch (cmd->head.type) {
+		case LX_CMD_TYPE_BLT:
+			return lx_cmd_blt_regids[reg];
+		case LX_CMD_TYPE_VEC:
+			return lx_cmd_vec_regids[reg];
+		case LX_CMD_TYPE_LUT:
+			if (reg == GP_LUT_INDEX)
+				return 0;
+			/* else fall through */
+		case LX_CMD_TYPE_DATA:
+			return -1;
+		}
+	}
+}
+
+static inline bool lx_cmd_set(union lx_cmd *cmd, unsigned gp_reg, u32 val)
+{
+	int cmd_reg = lx_cmd_get_regoff(cmd, gp_reg);
+
+	if (cmd_reg < 0)
+		return false;
+
+	cmd->body[cmd_reg] = val;
+	cmd->head.write_enables |= 1 << cmd_reg;
+	return true;
+}
 
 /* Display Controller registers (table 6-47 from the data book) */
 enum dc_registers {

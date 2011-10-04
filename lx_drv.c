@@ -291,20 +291,20 @@ static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
 
 /* length is in dwords */
 static void lx_cmd_write_locked(struct lx_priv *priv, u32 *data,
-				unsigned length)
+				unsigned count)
 {
 	unsigned wr = priv->cmd_write;
 	unsigned left = priv->cmd_buf_node->size - wr;
 	u32 __iomem *buf = priv->cmd_buf;
 
-	if (length > left) {
+	if (count > left) {
 		memcpy_toio(buf + wr, data, left * 4);
-		length -= left;
+		count -= left;
 		data += left;
 		wr = 0;
 	}
-	memcpy_toio(buf + wr, data, length * 4);
-	wr += length;
+	memcpy_toio(buf + wr, data, count * 4);
+	wr += count;
 
 	priv->cmd_write = wr;
 }
@@ -313,6 +313,8 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 			   u32 *post_data)
 {
 	struct lx_cmd_post *post = NULL;
+	bool post_enabled = false;
+	/* in bytes, including head and potentially existing post */
 	unsigned size;
 
 	switch (lx_cmd_type(cmd)) {
@@ -333,12 +335,19 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 		break;
 	}
 
-	BUG_ON(!(post && post->dcount) ^ !post_data);
+	if (post) {
+		unsigned post_off = (u32 *)post - cmd->body;
+		post_enabled = !!(cmd->head.write_enables & (1 << post_off));
+	}
+
+	/* don't allow post_data == NULL even if post->dcount == 0, since this
+	 * unnecessarily complicates things */
+	BUG_ON(!post_enabled ^ !post_data);
 
 	spin_lock(&priv->cmd_lock);
 
 	lx_cmd_write_locked(priv, (u32 *)cmd, size / 4);
-	if (post && post->dcount)
+	if (post_enabled)
 		lx_cmd_write_locked(priv, post_data, post->dcount);
 
 	if (cmd->head.wrap)
@@ -536,11 +545,105 @@ static int lx_fb_init(struct lx_priv *priv, struct lx_fb *lfb,
 	return 0;
 }
 
+#if 1
+static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
+{
+	struct lx_priv *priv = helper_to_lx_fb(info->par)->priv;
+	union lx_cmd cmd;
+
+	u32 blt_mode, stride, bpp;
+	u32 dx = region->dx, dy = region->dy;
+	u32 w = region->width, h = region->height;
+	u32 raster, dst_off, base_off, pat;
+
+	if (info->state != FBINFO_STATE_RUNNING)
+		return;
+	if (!h || !w)
+		return;
+	if (info->flags & FBINFO_HWACCEL_DISABLED) {
+		cfb_fillrect(info, region);
+		return;
+	}
+
+	stride	= info->fix.line_length;
+	bpp	= info->var.bits_per_pixel;
+	pat	= region->color;
+	if (info->fix.visual == FB_VISUAL_TRUECOLOR)
+		pat = ((u32 *)(info->pseudo_palette))[pat];
+
+	blt_mode = GP_BLT_MODE_SR_NONE | GP_BLT_MODE_X_INC | GP_BLT_MODE_Y_INC;
+	dst_off = info->fix.smem_start & ~0xff000000;
+	dst_off += dy * stride;
+	dst_off += dx * bpp / 8;
+
+	base_off = info->fix.smem_start & 0xff000000;
+
+	switch (region->rop) {
+	case ROP_COPY:
+		raster = 0xf0;
+		break;
+	case ROP_XOR:
+		raster = 0x5a;
+		blt_mode |= GP_BLT_MODE_DR;
+		break;
+	default:
+		printk(KERN_ERR "lx_fillrect(): unknown rop, defaulting to ROP_COPY\n");
+		raster = 0xf0;
+		break;
+	}
+	switch (bpp) {
+	case  8:
+		raster |= 0 << 28;
+		break;
+	case 16:
+		raster |= 6 << 28;
+		break;
+	case 24:
+	case 32:
+		raster |= 8 << 28;
+		break;
+	}
+
+	cmd.head.stall = 1;
+	cmd.head.type = LX_CMD_TYPE_BLT;
+	cmd.head.wrap = 0;
+	cmd.head.write_enables = 0;
+	cmd.blt.post.dtype = CMD_DTYPE_SRC_TO_SRC_CH;
+	cmd.blt.post.dcount = 0;
+
+	lx_cmd_set(&cmd, GP_CH3_MODE_STR, 0);
+	lx_cmd_set(&cmd, GP_RASTER_MODE, raster);
+	lx_cmd_set(&cmd, GP_PAT_COLOR_0, pat);
+	lx_cmd_set(&cmd, GP_BASE_OFFSET, base_off);
+	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off & ~0xff000000);
+	lx_cmd_set(&cmd, GP_STRIDE, stride); /* dst */
+	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0xffff) << 16 | (h & 0xffff));
+	lx_cmd_set(&cmd, GP_BLT_MODE, blt_mode);
+
+	lx_cmd_enqueue(priv, &cmd, NULL);
+
+#if 0
+	lx_gp_wait_idle(par, 1);
+
+	write_gp(par, GP_CH3_MODE_STR, 0);
+	write_gp(par, GP_RASTER_MODE, raster);
+	write_gp(par, GP_PAT_COLOR_0, pat);
+	write_gp(par, GP_BASE_OFFSET, base_off);
+	write_gp(par, GP_DST_OFFSET, dst_off & ~0xff000000);
+	write_gp(par, GP_STRIDE, stride); /* dst */
+	write_gp(par, GP_WID_HEIGHT, (w & 0xffff) << 16 | (h & 0xffff));
+
+	/* start the blit */
+	write_gp(par, GP_BLT_MODE, blt_mode);
+#endif
+}
+#endif
+
 static struct fb_ops lx_fb_ops = {
 	.owner = THIS_MODULE,
 	.fb_check_var = drm_fb_helper_check_var,
 	.fb_set_par = drm_fb_helper_set_par,
-	.fb_fillrect = cfb_fillrect,
+	.fb_fillrect = lx_fillrect,
 	.fb_copyarea = cfb_copyarea,
 	.fb_imageblit = cfb_imageblit,
 	.fb_pan_display = drm_fb_helper_pan_display,
