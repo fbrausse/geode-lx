@@ -333,12 +333,12 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 		break;
 	}
 
-	BUG_ON((!post) ^ (!post_data));
+	BUG_ON(!(post && post->dcount) ^ !post_data);
 
 	spin_lock(&priv->cmd_lock);
 
 	lx_cmd_write_locked(priv, (u32 *)cmd, size / 4);
-	if (post)
+	if (post && post->dcount)
 		lx_cmd_write_locked(priv, post_data, post->dcount);
 
 	lx_cmd_commit_locked(priv);
