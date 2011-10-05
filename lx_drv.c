@@ -777,7 +777,7 @@ static struct fb_ops lx_fb_ops = {
 	.fb_check_var = drm_fb_helper_check_var,
 	.fb_set_par = drm_fb_helper_set_par,
 	.fb_fillrect = lx_fillrect,
-	.fb_copyarea = cfb_copyarea,
+	.fb_copyarea = lx_copyarea,
 	.fb_imageblit = cfb_imageblit,
 	.fb_pan_display = drm_fb_helper_pan_display,
 	.fb_blank = drm_fb_helper_blank,
@@ -2879,10 +2879,10 @@ static int lx_map_video_memory(struct drm_device *dev)
 		 (unsigned long)priv->vmem_addr,
 		 ~priv->vmem_phys ? tmp : "unknown");
 
-	ret = lx_command_buffer_init(priv, 1 << 10);
+	ret = lx_command_buffer_init(priv, 64 << 10);
 	if (ret)
 		DRV_INFO("failed initializing command ring of size %u KB\n",
-			 1);
+			 64);
 
 	return 0;
 
