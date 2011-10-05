@@ -272,9 +272,7 @@ static bool lx_cmd_buffer_empty(struct lx_priv *priv)
 
 static void lx_cmd_commit_locked(struct lx_priv *priv)
 {
-	struct drm_mm_node *node = priv->cmd_buf_node;
-
-	write_gp(priv, GP_CMD_WRITE, node->start + priv->cmd_write);
+	write_gp(priv, GP_CMD_WRITE, priv->cmd_write * 4);
 }
 
 static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
@@ -294,7 +292,7 @@ static void lx_cmd_write_locked(struct lx_priv *priv, u32 *data,
 				unsigned count)
 {
 	unsigned wr = priv->cmd_write;
-	unsigned left = priv->cmd_buf_node->size - wr;
+	unsigned left = priv->cmd_buf_node->size / 4 - wr;
 	u32 __iomem *buf = priv->cmd_buf;
 
 	if (count > left) {
@@ -337,13 +335,14 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 
 	if (post) {
 		unsigned post_off = (u32 *)post - cmd->body;
-		post_enabled = !!(cmd->head.write_enables & (1 << post_off));
+		post_enabled = (cmd->head.write_enables & (1 << post_off)) &&
+			       post->dcount;
 	}
-
+#if 0
 	/* don't allow post_data == NULL even if post->dcount == 0, since this
 	 * unnecessarily complicates things */
 	BUG_ON(!post_enabled ^ !post_data);
-
+#endif
 	spin_lock(&priv->cmd_lock);
 
 	lx_cmd_write_locked(priv, (u32 *)cmd, size / 4);
@@ -572,10 +571,33 @@ static int lx_fb_init(struct lx_priv *priv, struct lx_fb *lfb,
 	return 0;
 }
 
+static int lx_sync(struct fb_info *info)
+{
+	struct lx_priv *priv = helper_to_lx_fb(info->par)->priv;
+	unsigned i;
+	u32 tmp;
+
+	for (i = 0; i < 1000; i++) {
+		tmp = read_gp(priv, GP_BLT_STATUS);
+		if (tmp & (GP_BLT_STATUS_PB | GP_BLT_STATUS_PP))
+			continue;
+		if (!(tmp & GP_BLT_STATUS_CE))
+			continue;
+		break;
+	}
+	if (i)
+		DRM_DEBUG_DRIVER("%08x, read: %08x, write: %08x, i: %u\n", tmp,
+				 read_gp(priv, GP_CMD_READ),
+				 read_gp(priv, GP_CMD_WRITE), i);
+
+	return 0;
+}
+
 #if 1
 static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 {
-	struct lx_priv *priv = helper_to_lx_fb(info->par)->priv;
+	struct lx_fb *lfb = helper_to_lx_fb(info->par);
+	struct lx_priv *priv = lfb->priv;
 	union lx_cmd cmd;
 
 	u32 blt_mode, stride, bpp;
@@ -599,17 +621,20 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 		pat = ((u32 *)(info->pseudo_palette))[pat];
 
 	blt_mode = GP_BLT_MODE_SR_NONE | GP_BLT_MODE_X_INC | GP_BLT_MODE_Y_INC;
-	dst_off = info->fix.smem_start & ~0xff000000;
+	dst_off  = info->fix.smem_start;
 	dst_off += dy * stride;
 	dst_off += dx * bpp / 8;
 
-	base_off = info->fix.smem_start & 0xff000000;
+	base_off = dst_off & 0xff000000;
+	dst_off &= ~0xff000000;
 
 	switch (region->rop) {
 	case ROP_COPY:
+		DRM_DEBUG_DRIVER("rop: copy at (%u,%u), %ux%u, bpp: %u, col: 0x%x\n", dx, dy, w, h, bpp, pat);
 		raster = 0xf0;
 		break;
 	case ROP_XOR:
+		DRM_DEBUG_DRIVER("rop: XOR at (%u,%u), %ux%u, bpp: %u, col: 0x%x\n", dx, dy, w, h, bpp, pat);
 		raster = 0x5a;
 		blt_mode |= GP_BLT_MODE_DR;
 		break;
@@ -642,10 +667,11 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 	lx_cmd_set(&cmd, GP_RASTER_MODE, raster);
 	lx_cmd_set(&cmd, GP_PAT_COLOR_0, pat);
 	lx_cmd_set(&cmd, GP_BASE_OFFSET, base_off);
-	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off & ~0xff000000);
+	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off);
 	lx_cmd_set(&cmd, GP_STRIDE, stride); /* dst */
-	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0xffff) << 16 | (h & 0xffff));
+	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0x0fff) << 16 | (h & 0x0fff));
 	lx_cmd_set(&cmd, GP_BLT_MODE, blt_mode);
+	lx_cmd_set(&cmd, LX_CMD_POST, 0);
 
 	lx_cmd_enqueue(priv, &cmd, NULL);
 
@@ -656,7 +682,7 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 	write_gp(par, GP_RASTER_MODE, raster);
 	write_gp(par, GP_PAT_COLOR_0, pat);
 	write_gp(par, GP_BASE_OFFSET, base_off);
-	write_gp(par, GP_DST_OFFSET, dst_off & ~0xff000000);
+	write_gp(par, GP_DST_OFFSET, dst_off);
 	write_gp(par, GP_STRIDE, stride); /* dst */
 	write_gp(par, GP_WID_HEIGHT, (w & 0xffff) << 16 | (h & 0xffff));
 
@@ -666,11 +692,43 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 }
 #endif
 
+static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
+{
+	struct lx_priv *priv = helper_to_lx_fb(info->par)->priv;
+	u32 dx = area->dx, dy = area->dy;
+	u32 w = area->width, h = area->height;
+	u32 sx = area->sx, sy = area->sy;
+
+	if (info->state != FBINFO_STATE_RUNNING)
+		return;
+	if (!h || !w || (sx == dx && sy == dy))
+		return;
+
+	lx_sync(info);
+
+	cfb_copyarea(info, area);
+}
+
+static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
+{
+	struct lx_priv *priv = helper_to_lx_fb(info->par)->priv;
+	u32 w = image->width, h = image->height;
+
+	if (info->state != FBINFO_STATE_RUNNING)
+		return;
+	if (!h || !w)
+		return;
+
+	lx_sync(info);
+
+	cfb_imageblit(info, image);
+}
+
 static struct fb_ops lx_fb_ops = {
 	.owner = THIS_MODULE,
 	.fb_check_var = drm_fb_helper_check_var,
 	.fb_set_par = drm_fb_helper_set_par,
-	.fb_fillrect = cfb_fillrect,
+	.fb_fillrect = lx_fillrect,
 	.fb_copyarea = cfb_copyarea,
 	.fb_imageblit = cfb_imageblit,
 	.fb_pan_display = drm_fb_helper_pan_display,
@@ -678,6 +736,7 @@ static struct fb_ops lx_fb_ops = {
 	.fb_setcmap = drm_fb_helper_setcmap,
 	.fb_debug_enter = drm_fb_helper_debug_enter,
 	.fb_debug_leave = drm_fb_helper_debug_leave,
+	.fb_sync = lx_sync,
 };
 
 /* pitch needs to be aligned to qword boundary */
@@ -766,7 +825,8 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	drm_fb_helper_fill_fix(info, fb->pitch, fb->depth);
 
-	info->flags = FBINFO_DEFAULT /*| FBINFO_VIRTFB*/;
+	info->flags = FBINFO_DEFAULT /*| FBINFO_VIRTFB*/ |
+		      FBINFO_HWACCEL_FILLRECT;
 	info->fbops = &lx_fb_ops;
 
 	info->fix.smem_start = bo->map->offset;
@@ -2622,40 +2682,58 @@ static bool lx_determine_vmem(resource_size_t *vmem_size,
 	return true;
 }
 
-static int lx_command_ring_init(struct lx_priv *priv, unsigned size)
+/* allocates / maps the memory */
+static int lx_command_buffer_init(struct lx_priv *priv, unsigned size)
 {
 	struct drm_mm_node *node;
-	u32 lo, hi;
 
 	node = lx_mm_alloc_end(priv, size, 1 << 20, 1);
 	if (!node)
 		return -ENOMEM;
 
-	priv->cmd_buf = ioremap(node->start + priv->vmem_addr, size);
+	priv->cmd_buf = ioremap_nocache(node->start + priv->vmem_addr, size);
 	priv->cmd_buf_node = node;
 	priv->cmd_write = 0;
 
-	rdmsr(LX_MSR(LX_GP, LX_GLD_MSR_CONFIG), lo, hi);
-	DRM_DEBUG_DRIVER("old GP's GLD_MSR_CONFIG: %08x_%08x\n", hi, lo);
 	DRV_INFO("command buffer addresses: lin @ 0x%08lx, virt @ 0x%08lx, "
 		 "size: %u KB\n",
 		 (unsigned long)(node->start + priv->vmem_addr),
 		 (unsigned long)priv->cmd_buf,
 		 size >> 10);
-	lo &= ~0x0fff0000;
-	lo |= (priv->vmem_addr >> 4) & 0x0fff0000;
-	wrmsr(LX_MSR(LX_GP, LX_GLD_MSR_CONFIG), lo, hi);
-
-	write_gp(priv, GP_CMD_TOP, node->start);
-	write_gp(priv, GP_CMD_BOT, node->start + size - 1);
-	write_gp(priv, GP_CMD_READ, node->start);
 
 	spin_lock_init(&priv->cmd_lock);
 
 	return 0;
 }
 
-static void lx_command_ring_fini(struct lx_priv *priv)
+/* writes the hardware with pre-allocated cmd buffer memory addresses */
+static void lx_command_ring_init(struct lx_priv *priv)
+{
+	struct drm_mm_node *node = priv->cmd_buf_node;
+	u32 lo, hi;
+
+	rdmsr(LX_MSR(LX_GP, LX_GLD_MSR_CONFIG), lo, hi);
+	DRM_DEBUG_DRIVER("old GP's GLD_MSR_CONFIG: %08x_%08x\n", hi, lo);
+	lo &= ~0x0fff0000;
+	lo |= ((node->start + priv->vmem_addr) >> 4) & 0x0fff0000;
+	wrmsr(LX_MSR(LX_GP, LX_GLD_MSR_CONFIG), lo, hi);
+	rdmsr(LX_MSR(LX_GP, LX_GLD_MSR_CONFIG), lo, hi);
+	DRM_DEBUG_DRIVER("new GP's GLD_MSR_CONFIG: %08x_%08x\n", hi, lo);
+
+	DRM_DEBUG_DRIVER("old cmd top: %08x, bot: %08x, rd: %08x\n",
+			 read_gp(priv, GP_CMD_TOP), read_gp(priv, GP_CMD_BOT),
+			 read_gp(priv, GP_CMD_READ));
+
+	write_gp(priv, GP_CMD_TOP, 0);
+	write_gp(priv, GP_CMD_BOT, node->size - 4);
+	write_gp(priv, GP_CMD_READ, 0);
+
+	DRM_DEBUG_DRIVER("new cmd top: %08x, bot: %08x, rd: %08x\n",
+			 read_gp(priv, GP_CMD_TOP), read_gp(priv, GP_CMD_BOT),
+			 read_gp(priv, GP_CMD_READ));
+}
+
+static void lx_command_buffer_fini(struct lx_priv *priv)
 {
 	if (priv->cmd_buf) {
 		iounmap(priv->cmd_buf);
@@ -2753,14 +2831,13 @@ static int lx_map_video_memory(struct drm_device *dev)
 		 (unsigned long)priv->vmem_addr,
 		 ~priv->vmem_phys ? tmp : "unknown");
 
-	ret = lx_command_ring_init(priv, 2 << 20);
+	ret = lx_command_buffer_init(priv, 1 << 20);
 	if (ret)
 		DRV_INFO("failed initializing command ring of size %u KB\n",
-			 2 << 10);
+			 1 << 10);
 
 	return 0;
 
-failed_init_cmd:
 failed_map_vp:
 	drm_rmmap(dev, priv->dc);
 failed_map_dc:
@@ -2780,7 +2857,7 @@ static void lx_unmap_video_memory(struct drm_device *dev)
 	struct pci_dev *pdev = dev->pdev;
 	struct lx_priv *priv = dev->dev_private;
 
-	lx_command_ring_fini(priv);
+	lx_command_buffer_fini(priv);
 
 	drm_rmmap(dev, priv->vp);
 	drm_rmmap(dev, priv->dc);
@@ -2827,6 +2904,8 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags)
 
 	drm_vblank_init(dev, 1 /* TODO: LX_NUM_CRTCS */);
 	drm_irq_install(dev);
+
+	lx_command_ring_init(priv);
 
 	rdmsr(0xa0002001, lo, hi);
 	DRM_DEBUG_DRIVER("GP GLD config: %08x\n", lo);
@@ -2968,14 +3047,12 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 	struct drm_device *dev = arg;
 	struct lx_priv *priv = dev->dev_private;
 	irqreturn_t ret = IRQ_NONE;
-	u32 dc_irq, gp_irq = 0;
+	u32 dc_irq, gp_irq;
 
 	/* this should be protected by disabled IRQs */
 	{
 		dc_irq = read_dc(priv, DC_IRQ);
-#if 0
 		gp_irq = read_gp(priv, GP_INT_CNTRL);
-#endif
 
 		dc_irq &= ~(dc_irq << 16); /* clear all masked interrupts */
 		gp_irq &= ~(gp_irq << 16); /* clear all masked interrupts */
@@ -2985,11 +3062,17 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 			dc_unlock(priv);
 			write_dc(priv, DC_IRQ, dc_irq); /* clear DC IRQ status */
 			dc_lock(priv);
+
+			ret = IRQ_HANDLED;
 		}
 
 		if (gp_irq & LX_IRQ_STATUS_MASK) {
 			/* some of GP's IRQ status bits seem to be enabled */
 			write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
+
+			ret = IRQ_HANDLED;
+
+			DRM_DEBUG_DRIVER("gp irq: %08x\n", gp_irq);
 		}
 	}
 
@@ -3005,17 +3088,13 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 		lx_crtc_do_page_flip(&priv->crtcs[LX_CRTC_GRAPHIC].base);
 
 		drm_handle_vblank(dev, LX_CRTC_GRAPHIC);
-		ret = IRQ_HANDLED;
 	}
 	if (dc_irq & DC_IRQ_VIP_VSYNC_IRQ_STATUS) {
-		ret = IRQ_HANDLED;
 	}
 
 	if (gp_irq & GP_INT_IDLE_STATUS) {
-		ret = IRQ_HANDLED;
 	}
 	if (gp_irq & GP_INT_CMD_BUF_EMPTY_STATUS) {
-		ret = IRQ_HANDLED;
 	}
 
 	return ret;
