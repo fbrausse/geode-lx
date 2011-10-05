@@ -281,7 +281,7 @@ static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
 
 	priv->cmd_buf[wr] = data;
 
-	if (++wr >= priv->cmd_buf_node->size)
+	if (++wr >= priv->cmd_buf_node->size / 4)
 		wr = 0;
 
 	priv->cmd_write = wr;
@@ -593,7 +593,6 @@ static int lx_sync(struct fb_info *info)
 	return 0;
 }
 
-#if 1
 static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 {
 	struct lx_fb *lfb = helper_to_lx_fb(info->par);
@@ -612,6 +611,8 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 	if (info->flags & FBINFO_HWACCEL_DISABLED) {
 		cfb_fillrect(info, region);
 		return;
+	} else {
+		lx_sync(info);
 	}
 
 	stride	= info->fix.line_length;
@@ -629,18 +630,15 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 	dst_off &= ~0xff000000;
 
 	switch (region->rop) {
+	default:
+		DRV_INFO("unknown rop, defaulting to ROP_COPY\n");
+		/* fall through */
 	case ROP_COPY:
-		DRM_DEBUG_DRIVER("rop: copy at (%u,%u), %ux%u, bpp: %u, col: 0x%x\n", dx, dy, w, h, bpp, pat);
 		raster = 0xf0;
 		break;
 	case ROP_XOR:
-		DRM_DEBUG_DRIVER("rop: XOR at (%u,%u), %ux%u, bpp: %u, col: 0x%x\n", dx, dy, w, h, bpp, pat);
 		raster = 0x5a;
 		blt_mode |= GP_BLT_MODE_DR;
-		break;
-	default:
-		printk(KERN_ERR "lx_fillrect(): unknown rop, defaulting to ROP_COPY\n");
-		raster = 0xf0;
 		break;
 	}
 	switch (bpp) {
@@ -656,12 +654,7 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 		break;
 	}
 
-	cmd.head.stall = 1;
-	cmd.head.type = LX_CMD_TYPE_BLT;
-	cmd.head.wrap = 0;
-	cmd.head.write_enables = 0;
-	cmd.blt.post.dtype = CMD_DTYPE_SRC_TO_SRC_CH;
-	cmd.blt.post.dcount = 0;
+	lx_cmd_init(&cmd, LX_CMD_TYPE_BLT);
 
 	lx_cmd_set(&cmd, GP_CH3_MODE_STR, 0);
 	lx_cmd_set(&cmd, GP_RASTER_MODE, raster);
@@ -671,42 +664,97 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 	lx_cmd_set(&cmd, GP_STRIDE, stride); /* dst */
 	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0x0fff) << 16 | (h & 0x0fff));
 	lx_cmd_set(&cmd, GP_BLT_MODE, blt_mode);
-	lx_cmd_set(&cmd, LX_CMD_POST, 0);
 
 	lx_cmd_enqueue(priv, &cmd, NULL);
-
-#if 0
-	lx_gp_wait_idle(par, 1);
-
-	write_gp(par, GP_CH3_MODE_STR, 0);
-	write_gp(par, GP_RASTER_MODE, raster);
-	write_gp(par, GP_PAT_COLOR_0, pat);
-	write_gp(par, GP_BASE_OFFSET, base_off);
-	write_gp(par, GP_DST_OFFSET, dst_off);
-	write_gp(par, GP_STRIDE, stride); /* dst */
-	write_gp(par, GP_WID_HEIGHT, (w & 0xffff) << 16 | (h & 0xffff));
-
-	/* start the blit */
-	write_gp(par, GP_BLT_MODE, blt_mode);
-#endif
 }
-#endif
 
 static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 {
-	struct lx_priv *priv = helper_to_lx_fb(info->par)->priv;
+	struct lx_fb *lfb = helper_to_lx_fb(info->par);
+	struct lx_priv *priv = lfb->priv;
+	union lx_cmd cmd;
+
+	u32 blt_mode, stride, bpp;
 	u32 dx = area->dx, dy = area->dy;
 	u32 w = area->width, h = area->height;
 	u32 sx = area->sx, sy = area->sy;
+	u32 src_off, dst_off, base_off, raster;
 
 	if (info->state != FBINFO_STATE_RUNNING)
 		return;
 	if (!h || !w || (sx == dx && sy == dy))
 		return;
+	if (info->flags & FBINFO_HWACCEL_DISABLED) {
+		cfb_copyarea(info, area);
+		return;
+	} else {
+		lx_sync(info);
+	}
 
-	lx_sync(info);
+	stride	= info->fix.line_length;
+	bpp	= info->var.bits_per_pixel;
 
-	cfb_copyarea(info, area);
+	/* copy a region from and to framebuffer which always has color data */
+	blt_mode = GP_BLT_MODE_SR_FB | GP_BLT_MODE_SM_COL;
+
+	src_off = dst_off = info->fix.smem_start & ~0xff000000;
+
+	if (dy >= sy) {
+		blt_mode |= GP_BLT_MODE_Y_DEC;
+		src_off += (sy + h - 1) * stride;
+		dst_off += (dy + h - 1) * stride;
+	} else {
+		blt_mode |= GP_BLT_MODE_Y_INC;
+		src_off += sy * stride;
+		dst_off += dy * stride;
+	}
+
+	if (dx >= sx) {
+		blt_mode |= GP_BLT_MODE_X_DEC;
+		src_off += (sx + w) * bpp / 8 - 1;
+		dst_off += (dx + w) * bpp / 8 - 1;
+	} else {
+		blt_mode |= GP_BLT_MODE_X_INC;
+		src_off += sx * bpp / 8;
+		dst_off += dx * bpp / 8;
+	}
+
+	base_off = info->fix.smem_start & 0xff000000;
+	base_off |= base_off >> 10;
+
+	raster = 0x100cc; /* source copy */
+	switch (bpp) {
+	case  8:
+		raster |= 0 << 28;	/* 0:3:3:2 */
+		break;
+	case 16:
+		raster |= 6 << 28;	/* 0:5:6:5 */
+		break;
+	case 24:
+	case 32:
+		raster |= 8 << 28;	/* 8:8:8:8 */
+		break;
+	}
+
+	lx_cmd_init(&cmd, LX_CMD_TYPE_BLT);
+	/* to be on the safe side: wait for the pipeline to become empty so that
+	 * no overlapping areas between this and the previous command get
+	 * cached */
+	cmd.head.stall = 1;
+
+	lx_cmd_set(&cmd, GP_CH3_MODE_STR, 0); /* channel 3 off */
+	lx_cmd_set(&cmd, GP_RASTER_MODE, raster);
+
+	/* set source and destination offsets to framebuffer region */
+	lx_cmd_set(&cmd, GP_BASE_OFFSET, base_off);
+	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off & ~0xff000000);
+	lx_cmd_set(&cmd, GP_SRC_OFFSET, src_off & ~0xff000000);
+	lx_cmd_set(&cmd, GP_STRIDE, stride << 16 | stride); /* src and dst */
+	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0x0fff) << 16 | (h & 0x0fff));
+
+	lx_cmd_set(&cmd, GP_BLT_MODE, blt_mode);
+
+	lx_cmd_enqueue(priv, &cmd, NULL);
 }
 
 static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
@@ -826,7 +874,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	drm_fb_helper_fill_fix(info, fb->pitch, fb->depth);
 
 	info->flags = FBINFO_DEFAULT /*| FBINFO_VIRTFB*/ |
-		      FBINFO_HWACCEL_FILLRECT;
+		      FBINFO_HWACCEL_FILLRECT | FBINFO_HWACCEL_COPYAREA;
 	info->fbops = &lx_fb_ops;
 
 	info->fix.smem_start = bo->map->offset;
@@ -2725,7 +2773,7 @@ static void lx_command_ring_init(struct lx_priv *priv)
 			 read_gp(priv, GP_CMD_READ));
 
 	write_gp(priv, GP_CMD_TOP, 0);
-	write_gp(priv, GP_CMD_BOT, node->size - 4);
+	write_gp(priv, GP_CMD_BOT, node->size - 32);
 	write_gp(priv, GP_CMD_READ, 0);
 
 	DRM_DEBUG_DRIVER("new cmd top: %08x, bot: %08x, rd: %08x\n",
@@ -2831,10 +2879,10 @@ static int lx_map_video_memory(struct drm_device *dev)
 		 (unsigned long)priv->vmem_addr,
 		 ~priv->vmem_phys ? tmp : "unknown");
 
-	ret = lx_command_buffer_init(priv, 1 << 20);
+	ret = lx_command_buffer_init(priv, 1 << 10);
 	if (ret)
 		DRV_INFO("failed initializing command ring of size %u KB\n",
-			 1 << 10);
+			 1);
 
 	return 0;
 

@@ -507,44 +507,53 @@ static const u8 lx_cmd_vec_regids[] = {
 	[GP_VECTOR_MODE]	= 12
 };
 
-enum {
-	LX_CMD_POST = ~0U
-};
+static inline struct lx_cmd_post * lx_cmd_get_post(union lx_cmd *cmd)
+{
+	switch (cmd->head.type) {
+	case LX_CMD_TYPE_BLT:
+		return &cmd->blt.post;
+	case LX_CMD_TYPE_VEC:
+		return NULL;
+	case LX_CMD_TYPE_LUT:
+		return &cmd->lut.post;
+	case LX_CMD_TYPE_DATA:
+		return &cmd->data.post;
+	}
+}
+
+static inline void lx_cmd_init(union lx_cmd *cmd, enum lx_cmd_type type)
+{
+	struct lx_cmd_post *post;
+
+	cmd->head.write_enables = 0;
+	cmd->head.stall = 0;
+	cmd->head.type = type;
+	cmd->head.wrap = 0;
+
+	post = lx_cmd_get_post(cmd);
+	if (post) {
+		post->dtype = 0;
+		post->dcount = 0;
+
+		/* undocumented: if present, the post field may not be disabled
+		 * through head.write_enables */
+		cmd->head.write_enables |= 1 << ((u32 *)post - cmd->body);
+	}
+}
 
 static inline int lx_cmd_get_regoff(union lx_cmd *cmd, unsigned reg)
 {
-	if (reg == LX_CMD_POST) {
-		struct lx_cmd_post *post;
-
-		/* compiler won't optimize lx_cmd_type() here ... why ever */
-		switch (cmd->head.type) {
-		case LX_CMD_TYPE_BLT:
-			post = &cmd->blt.post;
-			break;
-		case LX_CMD_TYPE_VEC:
-			return -1;
-		case LX_CMD_TYPE_LUT:
-			post = &cmd->lut.post;
-			break;
-		case LX_CMD_TYPE_DATA:
-			post = &cmd->data.post;
-			break;
-		}
-
-		return (u32 *)post - cmd->body;
-	} else {
-		switch (cmd->head.type) {
-		case LX_CMD_TYPE_BLT:
-			return lx_cmd_blt_regids[reg];
-		case LX_CMD_TYPE_VEC:
-			return lx_cmd_vec_regids[reg];
-		case LX_CMD_TYPE_LUT:
-			if (reg == GP_LUT_INDEX)
-				return 0;
-			/* else fall through */
-		case LX_CMD_TYPE_DATA:
-			return -1;
-		}
+	switch (cmd->head.type) {
+	case LX_CMD_TYPE_BLT:
+		return lx_cmd_blt_regids[reg];
+	case LX_CMD_TYPE_VEC:
+		return lx_cmd_vec_regids[reg];
+	case LX_CMD_TYPE_LUT:
+		if (reg == GP_LUT_INDEX)
+			return 0;
+		/* else fall through */
+	case LX_CMD_TYPE_DATA:
+		return -1;
 	}
 }
 
