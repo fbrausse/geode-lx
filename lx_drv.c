@@ -338,11 +338,7 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 		post_enabled = (cmd->head.write_enables & (1 << post_off)) &&
 			       post->dcount;
 	}
-#if 0
-	/* don't allow post_data == NULL even if post->dcount == 0, since this
-	 * unnecessarily complicates things */
-	BUG_ON(!post_enabled ^ !post_data);
-#endif
+
 	spin_lock(&priv->cmd_lock);
 
 	lx_cmd_write_locked(priv, (u32 *)cmd, size / 4);
@@ -611,8 +607,6 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 	if (info->flags & FBINFO_HWACCEL_DISABLED) {
 		cfb_fillrect(info, region);
 		return;
-	} else {
-		lx_sync(info);
 	}
 
 	stride	= info->fix.line_length;
@@ -687,8 +681,6 @@ static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 	if (info->flags & FBINFO_HWACCEL_DISABLED) {
 		cfb_copyarea(info, area);
 		return;
-	} else {
-		lx_sync(info);
 	}
 
 	stride	= info->fix.line_length;
@@ -766,8 +758,6 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 		return;
 	if (!h || !w)
 		return;
-
-	lx_sync(info);
 
 	cfb_imageblit(info, image);
 }
@@ -847,6 +837,11 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 		goto err_bo_destroy;
 	}
 	drm_core_ioremap_wc(bo->map, priv->ddev);
+
+	bo->width  = mode_cmd.width;
+	bo->height = mode_cmd.height;
+	bo->bpp    = mode_cmd.bpp;
+	bo->pitch  = mode_cmd.pitch;
 
 	mutex_lock(&dev->struct_mutex);
 

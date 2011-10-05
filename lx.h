@@ -37,7 +37,7 @@
  *   - compressed display buffer size (optional)
  * - command buffer:
  *   - check & accept the 4 types of commands
- *   - allow driver-specific commands by using bits [27:17]
+ *   - allow driver-specific commands by using bits [27:17]?
  *   - check for overlapping areas of subsequent blits and either reschedule or
  *     wait for gp-idle or reverse direction of the one or the other (or let
  *     userspace decide which resolution strategy shall be chosen/preferred)
