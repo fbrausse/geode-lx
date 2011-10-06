@@ -275,33 +275,13 @@ static void lx_cmd_commit_locked(struct lx_priv *priv)
 	write_gp(priv, GP_CMD_WRITE, priv->cmd_write * 4);
 }
 
-static inline void lx_cmd_write32_locked(struct lx_priv *priv, u32 data)
-{
-	unsigned wr = priv->cmd_write;
-
-	priv->cmd_buf[wr] = data;
-
-	if (++wr >= priv->cmd_buf_node->size / 4)
-		wr = 0;
-
-	priv->cmd_write = wr;
-}
-
 /* length is in dwords */
 static void lx_cmd_write_locked(struct lx_priv *priv, u32 *data,
 				unsigned count)
 {
 	unsigned wr = priv->cmd_write;
-	unsigned left = priv->cmd_buf_node->size / 4 - wr;
-	u32 __iomem *buf = priv->cmd_buf;
 
-	if (count > left) {
-		memcpy_toio(buf + wr, data, left * 4);
-		count -= left;
-		data += left;
-		wr = 0;
-	}
-	memcpy_toio(buf + wr, data, count * 4);
+	memcpy_toio(priv->cmd_buf + wr, data, count * 4);
 	wr += count;
 
 	priv->cmd_write = wr;
@@ -310,12 +290,25 @@ static void lx_cmd_write_locked(struct lx_priv *priv, u32 *data,
 static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 			   u32 *post_data)
 {
+	static const struct lx_cmd_data wrap_cmd = {
+		.head = {
+			.write_enables = 1,
+			.stall = 0,
+			.type = LX_CMD_TYPE_DATA,
+			.wrap = 1
+		},
+		.post = {
+			.dtype = 0,
+			.dcount = 0,
+		}
+	};
+
 	struct lx_cmd_post *post = NULL;
 	bool post_enabled = false;
 	/* in bytes, including head and potentially existing post */
-	unsigned size;
+	unsigned size, total, left;
 
-	switch (lx_cmd_type(cmd)) {
+	switch (cmd->head.type) {
 	case LX_CMD_TYPE_BLT:
 		size = sizeof(cmd->blt);
 		post = &cmd->blt.post;
@@ -339,7 +332,30 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 			       post->dcount;
 	}
 
+	total = size / 4;
+	if (post_enabled) /* TODO: adding post-data's size may not be needed */
+		total += post->dcount;
+	if (!cmd->head.wrap)
+		total += sizeof(wrap_cmd) / 4;
+
+	left = priv->cmd_buf_node->size / 4;
+
 	spin_lock(&priv->cmd_lock);
+
+	left -= priv->cmd_write;
+
+	if (total > left) {
+		/* explicitely wrap the command buffer by a dummy data packet,
+		 * because the spec is quite unclear about how auto-wrapping
+		 * should work and I haven't been able to figure it out by trial
+		 * and error */
+		lx_cmd_write_locked(priv, (u32 *)&wrap_cmd, sizeof(wrap_cmd) / 4);
+		priv->cmd_write = 0;
+		lx_cmd_commit_locked(priv);
+	}
+
+	/* TODO: if previous cmd explicitely wrapped, wait for hw cmd buf wrap
+	 *       or CMD_READ > total here */
 
 	lx_cmd_write_locked(priv, (u32 *)cmd, size / 4);
 	if (post_enabled)
@@ -581,11 +597,12 @@ static int lx_sync(struct fb_info *info)
 			continue;
 		break;
 	}
+#if 1
 	if (i)
 		DRM_DEBUG_DRIVER("%08x, read: %08x, write: %08x, i: %u\n", tmp,
 				 read_gp(priv, GP_CMD_READ),
 				 read_gp(priv, GP_CMD_WRITE), i);
-
+#endif
 	return 0;
 }
 
@@ -615,7 +632,7 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 	if (info->fix.visual == FB_VISUAL_TRUECOLOR)
 		pat = ((u32 *)(info->pseudo_palette))[pat];
 
-	blt_mode = GP_BLT_MODE_SR_NONE | GP_BLT_MODE_X_INC | GP_BLT_MODE_Y_INC;
+	blt_mode = GP_BLT_MODE_SR_NONE;
 	dst_off  = info->fix.smem_start;
 	dst_off += dy * stride;
 	dst_off += dx * bpp / 8;
@@ -628,23 +645,23 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 		DRV_INFO("unknown rop, defaulting to ROP_COPY\n");
 		/* fall through */
 	case ROP_COPY:
-		raster = 0xf0;
+		raster = 0xf0; /* pattern copy */
 		break;
 	case ROP_XOR:
-		raster = 0x5a;
-		blt_mode |= GP_BLT_MODE_DR;
+		raster = 0x5a; /* dest ^ pattern */
+		blt_mode |= GP_BLT_MODE_DR; /* destination data required */
 		break;
 	}
 	switch (bpp) {
 	case  8:
-		raster |= 0 << 28;
+		raster |= GP_RASTER_MODE_FMT_0332;
 		break;
 	case 16:
-		raster |= 6 << 28;
+		raster |= GP_RASTER_MODE_FMT_0565;
 		break;
 	case 24:
 	case 32:
-		raster |= 8 << 28;
+		raster |= GP_RASTER_MODE_FMT_8888;
 		break;
 	}
 
@@ -673,6 +690,7 @@ static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 	u32 w = area->width, h = area->height;
 	u32 sx = area->sx, sy = area->sy;
 	u32 src_off, dst_off, base_off, raster;
+	u32 ch3_mode;
 
 	if (info->state != FBINFO_STATE_RUNNING)
 		return;
@@ -687,63 +705,83 @@ static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 	bpp	= info->var.bits_per_pixel;
 
 	/* copy a region from and to framebuffer which always has color data */
-	blt_mode = GP_BLT_MODE_SR_FB | GP_BLT_MODE_SM_COL;
+	blt_mode = GP_BLT_MODE_SM_COL;
 
-	src_off = dst_off = info->fix.smem_start & ~0xff000000;
+	ch3_mode  = GP_CH3_MODE_STR_EN;
+	ch3_mode |= GP_CH3_MODE_STR_PS_SOURCE;
+	ch3_mode |= stride;
 
-	if (dy >= sy) {
-		blt_mode |= GP_BLT_MODE_Y_DEC;
+	src_off = dst_off = info->fix.smem_start;
+
+	base_off  = ((dst_off >> 22) & 0x3ff) << 22;
+	base_off |= ((src_off >> 22) & 0x3ff) <<  2;
+
+	if (sy < dy && dy < sy + h) {
+		blt_mode |= GP_BLT_MODE_Y_REVERSE;
+		ch3_mode |= GP_CH3_MODE_STR_Y_REVERSE;
 		src_off += (sy + h - 1) * stride;
 		dst_off += (dy + h - 1) * stride;
 	} else {
-		blt_mode |= GP_BLT_MODE_Y_INC;
 		src_off += sy * stride;
 		dst_off += dy * stride;
 	}
 
-	if (dx >= sx) {
-		blt_mode |= GP_BLT_MODE_X_DEC;
+	if (sx < dx && dx < sx + w) {
+		blt_mode |= GP_BLT_MODE_X_REVERSE;
+		ch3_mode |= GP_CH3_MODE_STR_X_REVERSE;
 		src_off += (sx + w) * bpp / 8 - 1;
 		dst_off += (dx + w) * bpp / 8 - 1;
 	} else {
-		blt_mode |= GP_BLT_MODE_X_INC;
 		src_off += sx * bpp / 8;
 		dst_off += dx * bpp / 8;
 	}
 
-	base_off = info->fix.smem_start & 0xff000000;
-	base_off |= base_off >> 10;
+	dst_off -= ((base_off >> 22) & 0x3ff) << 22;
+	src_off -= ((base_off >>  2) & 0x3ff) << 22;
 
-	raster = 0x100cc; /* source copy */
+	raster = 0xcc; /* ROP: source copy */
 	switch (bpp) {
 	case  8:
-		raster |= 0 << 28;	/* 0:3:3:2 */
+		raster |= GP_RASTER_MODE_FMT_0332;
+		ch3_mode |= GP_CH3_MODE_STR_FMT_8BPP_0332;
 		break;
 	case 16:
-		raster |= 6 << 28;	/* 0:5:6:5 */
+		raster |= GP_RASTER_MODE_FMT_0565;
+		ch3_mode |= GP_CH3_MODE_STR_FMT_16BPP_0565;
 		break;
 	case 24:
 	case 32:
-		raster |= 8 << 28;	/* 8:8:8:8 */
+		raster |= GP_RASTER_MODE_FMT_8888;
+		ch3_mode |= GP_CH3_MODE_STR_FMT_32BPP_8888;
 		break;
 	}
-
+#if 0
+	DRM_DEBUG_DRIVER("src @ %u,%u -> dst @ %u,%u dim %ux%u, "
+			 "bpp: %u, stride: %u, reverse: %d,%d, "
+			 "base off: 0x%08x, dst: 0x%06x, src: 0x%06x\n",
+			 sx, sy, dx, dy, w, h, bpp, stride,
+			 !!(blt_mode & GP_BLT_MODE_X_REVERSE),
+			 !!(blt_mode & GP_BLT_MODE_Y_REVERSE),
+			 base_off, dst_off, src_off);
+#endif
 	lx_cmd_init(&cmd, LX_CMD_TYPE_BLT);
 	/* to be on the safe side: wait for the pipeline to become empty so that
 	 * no overlapping areas between this and the previous command get
 	 * cached */
-	cmd.head.stall = 1;
+	cmd.blt.head.stall = 0;
 
-	lx_cmd_set(&cmd, GP_CH3_MODE_STR, 0); /* channel 3 off */
 	lx_cmd_set(&cmd, GP_RASTER_MODE, raster);
 
 	/* set source and destination offsets to framebuffer region */
 	lx_cmd_set(&cmd, GP_BASE_OFFSET, base_off);
-	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off & ~0xff000000);
-	lx_cmd_set(&cmd, GP_SRC_OFFSET, src_off & ~0xff000000);
-	lx_cmd_set(&cmd, GP_STRIDE, stride << 16 | stride); /* src and dst */
+	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off);
+	lx_cmd_set(&cmd, GP_CH3_MODE_STR, ch3_mode); /* channel 3 off */
+	// lx_cmd_set(&cmd, GP_SRC_OFFSET, src_off & ~0xff000000);
+	lx_cmd_set(&cmd, GP_CH3_OFFSET, src_off);
 	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0x0fff) << 16 | (h & 0x0fff));
+	lx_cmd_set(&cmd, GP_CH3_WIDHI, (w & 0x0fff) << 16 | (h & 0x0fff));
 
+	lx_cmd_set(&cmd, GP_STRIDE, stride << 16 | stride); /* src and dst */
 	lx_cmd_set(&cmd, GP_BLT_MODE, blt_mode);
 
 	lx_cmd_enqueue(priv, &cmd, NULL);
@@ -751,7 +789,7 @@ static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 
 static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 {
-	struct lx_priv *priv = helper_to_lx_fb(info->par)->priv;
+	// struct lx_priv *priv = helper_to_lx_fb(info->par)->priv;
 	u32 w = image->width, h = image->height;
 
 	if (info->state != FBINFO_STATE_RUNNING)
@@ -868,8 +906,11 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	drm_fb_helper_fill_fix(info, fb->pitch, fb->depth);
 
-	info->flags = FBINFO_DEFAULT /*| FBINFO_VIRTFB*/ |
-		      FBINFO_HWACCEL_FILLRECT | FBINFO_HWACCEL_COPYAREA;
+	info->flags = FBINFO_DEFAULT |
+		      FBINFO_HWACCEL_FILLRECT |
+		      FBINFO_HWACCEL_COPYAREA |
+		      FBINFO_VIRTFB |
+		      FBINFO_READS_FAST;
 	info->fbops = &lx_fb_ops;
 
 	info->fix.smem_start = bo->map->offset;
@@ -2517,13 +2558,10 @@ static void lx_modeset_init(struct drm_device *dev) {
 
 	/* TODO: create & attach connector/encoder specific drm props */
 
-	ret = lx_fbdev_init(dev);
-
 	drm_kms_helper_poll_init(dev);
 }
 
 static void lx_modeset_cleanup(struct drm_device *dev) {
-	lx_fbdev_fini(dev);
 	drm_mode_config_cleanup(dev);
 	drm_kms_helper_poll_fini(dev);
 	/* delete DDC i2c_adapter (if available) */
@@ -2730,6 +2768,8 @@ static int lx_command_buffer_init(struct lx_priv *priv, unsigned size)
 {
 	struct drm_mm_node *node;
 
+	/* TODO: get rid of 1 MB alignment, rather use size-alignment;
+	 *       requires to save CMD_TOP to be able to wrap the buffer */
 	node = lx_mm_alloc_end(priv, size, 1 << 20, 1);
 	if (!node)
 		return -ENOMEM;
@@ -2768,7 +2808,7 @@ static void lx_command_ring_init(struct lx_priv *priv)
 			 read_gp(priv, GP_CMD_READ));
 
 	write_gp(priv, GP_CMD_TOP, 0);
-	write_gp(priv, GP_CMD_BOT, node->size - 32);
+	write_gp(priv, GP_CMD_BOT, node->size - 4);
 	write_gp(priv, GP_CMD_READ, 0);
 
 	DRM_DEBUG_DRIVER("new cmd top: %08x, bot: %08x, rd: %08x\n",
@@ -2874,10 +2914,10 @@ static int lx_map_video_memory(struct drm_device *dev)
 		 (unsigned long)priv->vmem_addr,
 		 ~priv->vmem_phys ? tmp : "unknown");
 
-	ret = lx_command_buffer_init(priv, 64 << 10);
+	ret = lx_command_buffer_init(priv, 1024 << 10);
 	if (ret)
 		DRV_INFO("failed initializing command ring of size %u KB\n",
-			 64);
+			 1024);
 
 	return 0;
 
@@ -2943,12 +2983,20 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags)
 		goto failed_map_video_memory;
 	}
 
+	write_gp(priv, GP_RESET, GP_RESET_RESET);
+
 	lx_modeset_init(dev);
 
-	drm_vblank_init(dev, 1 /* TODO: LX_NUM_CRTCS */);
+	drm_vblank_init(dev, 1 /* TODO: LX_NUM_CRTCS */); /* needs drm structs */
 	drm_irq_install(dev);
 
-	lx_command_ring_init(priv);
+	lx_command_ring_init(priv); /* needs IRQs enabled */
+
+	ret = lx_fbdev_init(dev); /* needs cmd buffer initialized */
+	if (ret) {
+		DRV_ERR("failed initializing fbdev: %d\n", ret);
+		/* TODO */
+	}
 
 	rdmsr(0xa0002001, lo, hi);
 	DRM_DEBUG_DRIVER("GP GLD config: %08x\n", lo);
@@ -3000,6 +3048,8 @@ static int lx_driver_unload(struct drm_device *dev)
 {
 	struct lx_priv *priv = dev->dev_private;
 	int ret = 0;
+
+	lx_fbdev_fini(dev);
 
 	if (dev->irq_enabled) {
 		ret = drm_irq_uninstall(dev);
@@ -3114,8 +3164,9 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 			write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
 
 			ret = IRQ_HANDLED;
-
+#if 0
 			DRM_DEBUG_DRIVER("gp irq: %08x\n", gp_irq);
+#endif
 		}
 	}
 
@@ -3204,7 +3255,16 @@ static void lx_driver_irq_preinstall(struct drm_device *dev)
 
 static int lx_driver_irq_postinstall(struct drm_device *dev)
 {
+	struct lx_priv *priv = dev->dev_private;
+	u32 irq;
+
 	lx_irq_enable_vblank(dev);
+
+	irq = read_gp(priv, GP_INT_CNTRL);
+	irq &= ~LX_IRQ_STATUS_MASK;
+	irq &= ~GP_INT_IDLE_MASK;
+	irq &= ~GP_INT_CMD_BUF_EMPTY_MASK;
+	write_gp(priv, GP_INT_CNTRL, irq);
 
 	return 0;
 }

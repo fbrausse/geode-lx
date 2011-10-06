@@ -426,6 +426,7 @@ enum gp_registers {
 
 	GP_BLT_MODE,
 	GP_BLT_STATUS,
+	GP_RESET = GP_BLT_STATUS, /* alias */
 	GP_HST_SRC,
 	GP_BASE_OFFSET,
 
@@ -446,10 +447,8 @@ enum gp_registers {
 
 #define GP_BLT_MODE_CP                  (1 << 11) /* interrupt when BLT done */
 #define GP_BLT_MODE_TH                  (1 << 10) /* begin BLT at next VBLANK */
-#define GP_BLT_MODE_X_DEC               (1 << 9) /* negative increment for x */
-#define GP_BLT_MODE_X_INC               (0 << 9) /* positive increment for x */
-#define GP_BLT_MODE_Y_DEC               (1 << 8) /* negative increment for y */
-#define GP_BLT_MODE_Y_INC               (0 << 8) /* positive increment for y */
+#define GP_BLT_MODE_X_REVERSE		(1 << 9) /* negative increment for x */
+#define GP_BLT_MODE_Y_REVERSE		(1 << 8) /* negative increment for y */
 #define GP_BLT_MODE_SM_MONO_PACK        (2 << 6) /* src is byte-packed mono */
 #define GP_BLT_MODE_SM_MONO_UNPACK      (1 << 6) /* src is unpacked mono */
 #define GP_BLT_MODE_SM_COL              (0 << 6) /* src is color bitmap */
@@ -466,6 +465,72 @@ enum gp_registers {
 #define GP_BLT_STATUS_PP                (1 << 2) /* primitive pending */
 #define GP_BLT_STATUS_IN                (1 << 1) /* GP interrupt signal */
 #define GP_BLT_STATUS_PB                (1 << 0) /* primitive busy */
+
+#define GP_RESET_RESET			(0x69 << 24)
+
+#define GP_BASE_OFFSET_MASK		(0x3ff)
+#define GP_BASE_OFFSET_SHIFT		(22) /* upper 10 bits of 32 bit addresses */
+#define GP_BASE_OFFSET_DST_SHIFT	(22)
+#define GP_BASE_OFFSET_SRC_SHIFT	(12)
+#define GP_BASE_OFFSET_CH3_SHIFT	( 2)
+
+#define GP_RASTER_MODE_FMT_0332		(0 << 28)
+#define GP_RASTER_MODE_FMT_4444		(4 << 28)
+#define GP_RASTER_MODE_FMT_1555		(5 << 28)
+#define GP_RASTER_MODE_FMT_0565		(6 << 28)
+#define GP_RASTER_MODE_FMT_8888		(8 << 28)
+#define GP_RASTER_MODE_EN_ROP		(0 << 22)
+#define GP_RASTER_MODE_EN_ALPHA_TO_RGB	(1 << 22)
+#define GP_RASTER_MODE_EN_ALPHA_TO_A	(2 << 22)
+#define GP_RASTER_MODE_EN_ALPHA_TO_ARGB	(3 << 22)
+#define GP_RASTER_MODE_OS_ALPHA_CH_A	(0 << 20) /* alpha * channel A */
+#define GP_RASTER_MODE_OS_NALPHA_CH_B	(1 << 20) /* (1-alpha) * channel B */
+#define GP_RASTER_MODE_OS_A_ALPHA_NCH_B	(2 << 20) /* A  + (1-alpha) * B */
+#define GP_RASTER_MODE_OS_ALPHA_CH_A_NB	(3 << 20) /* alpha * A + (1-alpha) * B */
+#define GP_RASTER_MODE_AS_SEL_ALPHA	(0 << 19)
+#define GP_RASTER_MODE_AS_SEL_COLOR	(1 << 19)
+#define GP_RASTER_MODE_AS_CH_A		(0 << 17)
+#define GP_RASTER_MODE_AS_CH_B		(1 << 17)
+#define GP_RASTER_MODE_AS_CONST		(2 << 17)
+#define GP_RASTER_MODE_AS_OPAQUE	(3 << 17)
+#define GP_RASTER_MODE_AS_CH3_ALPHA	(GP_RASTER_MODE_AS_SEL_COLOR | \
+					 GP_RASTER_MODE_AS_CONST)
+#define GP_RASTER_MODE_CS		(1 << 16) /* if set: A dest, B source */
+#define GP_RASTER_MODE_SI		(1 << 13) /* source invert */
+#define GP_RASTER_MODE_PI		(1 << 12) /* pattern invert */
+#define GP_RASTER_MODE_ST		(1 << 11) /* source transparency */
+#define GP_RASTER_MODE_PT		(1 << 10) /* pattern transparency */
+#define GP_RASTER_MODE_PM_SOLID		(0 << 8) /* pattern mode */
+#define GP_RASTER_MODE_PM_MONO		(1 << 8)
+#define GP_RASTER_MODE_PM_COLOR		(2 << 8)
+#define GP_RASTER_MODE_ROP_ALPHA_MASK	(0xff)
+
+/* (A): needs AS_CH3_ALPHA in GP_RASTER_MODE, no BGR */
+/* (B): width specified in DWORDS instead of pixels, aligned to DWORDs, no BGR */
+/* (C): source and dest. stride must be aligned to a cache line boundary,
+ *      (32 bytes), no PL */
+#define GP_CH3_MODE_STR_EN		(1 << 31)
+#define GP_CH3_MODE_STR_PS_PATTERN	(0 << 30)
+#define GP_CH3_MODE_STR_PS_SOURCE	(1 << 30)
+#define GP_CH3_MODE_STR_X_REVERSE	(1 << 29)
+#define GP_CH3_MODE_STR_Y_REVERSE	(1 << 28)
+#define GP_CH3_MODE_STR_FMT_8BPP_0332	( 0 << 24)
+#define GP_CH3_MODE_STR_FMT_8BPP_INDEX	( 1 << 24)
+#define GP_CH3_MODE_STR_FMT_8BPP_ALPHA	( 2 << 24) /* (A) */
+#define GP_CH3_MODE_STR_FMT_16BPP_4444	( 4 << 24)
+#define GP_CH3_MODE_STR_FMT_16BPP_0565	( 6 << 24)
+#define GP_CH3_MODE_STR_FMT_YUV_422	( 7 << 24)
+#define GP_CH3_MODE_STR_FMT_32BPP_8888	( 8 << 24)
+#define GP_CH3_MODE_STR_FMT_24BPP_0888	(11 << 24) /* packed, (B) */
+#define GP_CH3_MODE_STR_FMT_4BPP_INDEX	(13 << 24)
+#define GP_CH3_MODE_STR_FMT_4BPP_ALPHA	(14 << 24) /* (A) */
+#define GP_CH3_MODE_STR_RO		(1 << 23) /* (C) */
+#define GP_CH3_MODE_STR_BGR		(1 << 22)
+#define GP_CH3_MODE_STR_PM		(1 << 21)
+#define GP_CH3_MODE_STR_PL		(1 << 20)
+#define GP_CH3_MODE_STR_PE		(1 << 19)
+#define GP_CH3_MODE_STR_HS		(1 << 18)
+#define GP_CH3_MODE_STR_STRIDE_MASK	(0xffff)
 
 #define GP_INT_IDLE_STATUS		(1 << 17)
 #define GP_INT_CMD_BUF_EMPTY_STATUS	(1 << 16)
@@ -553,6 +618,8 @@ static inline int lx_cmd_get_regoff(union lx_cmd *cmd, unsigned reg)
 			return 0;
 		/* else fall through */
 	case LX_CMD_TYPE_DATA:
+		DRM_ERROR("illegal reg %d for command of type %d\n",
+			  reg, cmd->head.type);
 		return -1;
 	}
 }
