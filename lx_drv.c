@@ -275,8 +275,8 @@ static void lx_cmd_commit_locked(struct lx_priv *priv)
 	write_gp(priv, GP_CMD_WRITE, priv->cmd_write * 4);
 }
 
-/* length is in dwords */
-static void lx_cmd_write_locked(struct lx_priv *priv, u32 *data,
+/* count is in dwords */
+static void lx_cmd_write_locked(struct lx_priv *priv, const u32 *data,
 				unsigned count)
 {
 	unsigned wr = priv->cmd_write;
@@ -287,23 +287,30 @@ static void lx_cmd_write_locked(struct lx_priv *priv, u32 *data,
 	priv->cmd_write = wr;
 }
 
-static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
-			   u32 *post_data)
-{
-	static const struct lx_cmd_data wrap_cmd = {
-		.head = {
-			.write_enables = 1,
-			.stall = 0,
-			.type = LX_CMD_TYPE_DATA,
-			.wrap = 1
-		},
-		.post = {
-			.dtype = 0,
-			.dcount = 0,
-		}
-	};
+static const struct lx_cmd_data wrap_cmd = {
+	.head = {
+		.write_enables = 1,
+		.stall = 0,
+		.type = LX_CMD_TYPE_DATA,
+		.wrap = 1
+	},
+	.post = {
+		.dtype = 0,
+		.dcount = 0,
+	}
+};
 
-	struct lx_cmd_post *post = NULL;
+static void lx_cmd_flush_locked(struct lx_priv *priv)
+{
+	lx_cmd_write_locked(priv, (u32 *)&wrap_cmd, sizeof(wrap_cmd) / 4);
+	priv->cmd_write = 0;
+	lx_cmd_commit_locked(priv);
+}
+
+static void lx_cmd_enqueue(struct lx_priv *priv, const union lx_cmd *cmd,
+			   const u32 *post_data)
+{
+	const struct lx_cmd_post *post = NULL;
 	bool post_enabled = false;
 	/* in bytes, including head and potentially existing post */
 	unsigned size, total, left;
@@ -349,9 +356,7 @@ static void lx_cmd_enqueue(struct lx_priv *priv, union lx_cmd *cmd,
 		 * because the spec is quite unclear about how auto-wrapping
 		 * should work and I haven't been able to figure it out by trial
 		 * and error */
-		lx_cmd_write_locked(priv, (u32 *)&wrap_cmd, sizeof(wrap_cmd) / 4);
-		priv->cmd_write = 0;
-		lx_cmd_commit_locked(priv);
+		lx_cmd_flush_locked(priv);
 	}
 
 	/* TODO: if previous cmd explicitely wrapped, wait for hw cmd buf wrap
@@ -473,10 +478,11 @@ static struct lx_bo * lx_bo_create(struct drm_file *file_priv,
 			ret = idr_get_new(&file_priv->object_idr, bo, &bo->id);
 			spin_unlock(&file_priv->table_lock);
 		} while (ret == -EAGAIN);
+
+		if (ret == -ENOSPC)
+			goto err;
 	}
 
-	if (ret == -ENOSPC)
-		goto err;
 
 	bo->node = node;
 	return bo;
@@ -755,20 +761,16 @@ static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 		ch3_mode |= GP_CH3_MODE_STR_FMT_32BPP_8888;
 		break;
 	}
-#if 0
-	DRM_DEBUG_DRIVER("src @ %u,%u -> dst @ %u,%u dim %ux%u, "
-			 "bpp: %u, stride: %u, reverse: %d,%d, "
-			 "base off: 0x%08x, dst: 0x%06x, src: 0x%06x\n",
-			 sx, sy, dx, dy, w, h, bpp, stride,
-			 !!(blt_mode & GP_BLT_MODE_X_REVERSE),
-			 !!(blt_mode & GP_BLT_MODE_Y_REVERSE),
-			 base_off, dst_off, src_off);
-#endif
+
 	lx_cmd_init(&cmd, LX_CMD_TYPE_BLT);
+
+/* appears not to be needed for fbcon */
+#if 0
 	/* to be on the safe side: wait for the pipeline to become empty so that
 	 * no overlapping areas between this and the previous command get
 	 * cached */
-	cmd.blt.head.stall = 0;
+	cmd.blt.head.stall = 1;
+#endif
 
 	lx_cmd_set(&cmd, GP_RASTER_MODE, raster);
 
@@ -789,15 +791,151 @@ static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 
 static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 {
-	// struct lx_priv *priv = helper_to_lx_fb(info->par)->priv;
+	struct lx_fb *lfb = helper_to_lx_fb(info->par);
+	struct lx_priv *priv = lfb->priv;
+	union lx_cmd cmd;
+
+	u32 dx = image->dx, dy = image->dy;
 	u32 w = image->width, h = image->height;
+	u32 blt_mode, base_off, dst_off, bpp, stride, fg, bg, raster;
+	u32 ch3_mode, img_stride;
 
 	if (info->state != FBINFO_STATE_RUNNING)
 		return;
 	if (!h || !w)
 		return;
 
-	cfb_imageblit(info, image);
+	/* There's no point in implementing colored image blits as the hardware
+	 * support for color space / depth conversion won't be used by the
+	 * callers of fb_imageblit (e.g. the logo code) as they do transform the
+	 * source image to the framebuffer depth themselves in software already.
+	 * So the potential speed gain is wasted. */
+	if (info->flags & FBINFO_HWACCEL_DISABLED /*|| image->depth != 1 ||
+	    (w & 7) || ((w * h) & 31) || (w * h / 32) > 0x300*/) {
+		cfb_imageblit(info, image);
+		return;
+	}
+
+	stride = info->fix.line_length;
+	bpp = info->var.bits_per_pixel;
+
+	raster = 0xcc; /* source copy */
+	switch (bpp) {
+	case  8:
+		raster |= GP_RASTER_MODE_FMT_0332;
+		break;
+	case 16:
+		raster |= GP_RASTER_MODE_FMT_0565;
+		break;
+	case 24:
+	case 32:
+		raster |= GP_RASTER_MODE_FMT_8888;
+		break;
+	}
+
+	base_off = info->fix.smem_start & 0xff000000;
+	dst_off = info->fix.smem_start & ~0xff000000;
+	dst_off += dy * stride;
+	dst_off += dx * ALIGN(bpp, 8) / 8;
+
+	blt_mode = 0;
+	ch3_mode = 0;
+
+	switch (image->depth) {
+	case 1:
+		break;
+	case 4:
+		ch3_mode |= GP_CH3_MODE_STR_FMT_4BPP_INDEX;
+		break;
+	case 8:
+		ch3_mode |= GP_CH3_MODE_STR_FMT_8BPP_INDEX;
+		break;
+	case 15:
+		ch3_mode |= GP_CH3_MODE_STR_FMT_16BPP_1555;
+		break;
+	case 16:
+		ch3_mode |= GP_CH3_MODE_STR_FMT_16BPP_0565;
+		break;
+	case 24:
+		ch3_mode |= GP_CH3_MODE_STR_FMT_24BPP_0888;
+		break;
+	case 32:
+		ch3_mode |= GP_CH3_MODE_STR_FMT_32BPP_8888;
+		break;
+	default:
+		cfb_imageblit(info, image);
+		return;
+	}
+
+	img_stride = w * ALIGN(image->depth, 8) / 8;
+
+	lx_cmd_init(&cmd, LX_CMD_TYPE_BLT);
+	cmd.blt.post.dcount = h * img_stride;
+
+	if (image->depth == 1) {
+		/* setup old source channel */
+		blt_mode |= GP_BLT_MODE_SM_MONO_PACK;
+		blt_mode |= GP_BLT_MODE_SR_HOST;
+
+		cmd.blt.post.dtype = CMD_DTYPE_SRC_TO_SRC_CH;
+
+		fg = image->fg_color;
+		bg = image->bg_color;
+		if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
+			fg = ((u32 *)(info->pseudo_palette))[fg];
+			bg = ((u32 *)(info->pseudo_palette))[bg];
+		}
+
+		lx_cmd_set(&cmd, GP_SRC_COLOR_FG, fg);
+		lx_cmd_set(&cmd, GP_SRC_COLOR_BG, bg);
+	} else {
+		/* setup channel 3 */
+		blt_mode |= GP_BLT_MODE_SM_COL;
+
+		ch3_mode |= GP_CH3_MODE_STR_EN;
+		ch3_mode |= GP_CH3_MODE_STR_PS_SOURCE;
+		/* LUT for CH3 and indexed modes? */
+		ch3_mode |= GP_CH3_MODE_STR_HS;
+		ch3_mode |= img_stride;
+
+		cmd.blt.post.dtype = CMD_DTYPE_SRC_TO_CH3;
+	}
+
+	// lx_gp_wait_idle(par, 0);
+
+	lx_cmd_set(&cmd, GP_RASTER_MODE, raster);
+
+	lx_cmd_set(&cmd, GP_CH3_MODE_STR, ch3_mode);
+	lx_cmd_set(&cmd, GP_BASE_OFFSET, base_off);
+	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off & ~0xff000000);
+	lx_cmd_set(&cmd, GP_STRIDE, img_stride << 16 | stride); /* src and dst */
+	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0xffff) << 16 | (h & 0xffff));
+
+	lx_cmd_set(&cmd, GP_BLT_MODE, blt_mode);
+
+	lx_cmd_enqueue(priv, &cmd, (const void *)image->data);
+
+#if 0
+	/* wait for this operation to start */
+	do {
+		j = read_gp(par, GP_BLT_STATUS);
+	} while (!(j & GP_BLT_STATUS_PB));
+
+	i = w * h;
+	while (1) {
+		while (!(j & GP_BLT_STATUS_SHE));
+			j = read_gp(par, GP_BLT_STATUS);
+		for (j=8; j; j--) {
+			write_gp(par, GP_HST_SRC, *src++);
+			i -= 32;
+			if (i < 0) {
+				lx_gp_wait_idle(par, 0);
+				return;
+			}
+		}
+		j = read_gp(par, GP_BLT_STATUS);
+	}
+#endif
 }
 
 static struct fb_ops lx_fb_ops = {
@@ -806,13 +944,13 @@ static struct fb_ops lx_fb_ops = {
 	.fb_set_par = drm_fb_helper_set_par,
 	.fb_fillrect = lx_fillrect,
 	.fb_copyarea = lx_copyarea,
-	.fb_imageblit = cfb_imageblit,
+	.fb_imageblit = lx_imageblit,
 	.fb_pan_display = drm_fb_helper_pan_display,
 	.fb_blank = drm_fb_helper_blank,
 	.fb_setcmap = drm_fb_helper_setcmap,
 	.fb_debug_enter = drm_fb_helper_debug_enter,
 	.fb_debug_leave = drm_fb_helper_debug_leave,
-	.fb_sync = lx_sync,
+	// .fb_sync = lx_sync,
 };
 
 /* pitch needs to be aligned to qword boundary */
@@ -909,8 +1047,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->flags = FBINFO_DEFAULT |
 		      FBINFO_HWACCEL_FILLRECT |
 		      FBINFO_HWACCEL_COPYAREA |
-		      FBINFO_VIRTFB |
-		      FBINFO_READS_FAST;
+		      FBINFO_HWACCEL_IMAGEBLIT;
 	info->fbops = &lx_fb_ops;
 
 	info->fix.smem_start = bo->map->offset;

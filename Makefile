@@ -3,7 +3,9 @@ ifneq ($(KERNELVERSION),)
 	obj-m := lx.o
 	lx-y := lx_drv.o lx_i2c.o
 else
-	KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+#	KERNELDIR ?= $(wildcard /home/kane/bin/linux-3.0)
+#	KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+	KERNELDIR ?= $(if $(wildcard /home/kane/bin/linux-3.0),/home/kane/bin/linux-3.0,/lib/modules/$(shell uname -r)/build)
 	PWD := $(shell pwd)
 
 3.0:

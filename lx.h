@@ -37,7 +37,8 @@
  *   - compressed display buffer size (optional)
  * - command buffer:
  *   - check & accept the 4 types of commands
- *   - allow driver-specific commands by using bits [27:17]?
+ *   - any driver-specific commands necessary?
+ *     - init: command buffer size, compression allowed
  *   - check for overlapping areas of subsequent blits and either reschedule or
  *     wait for gp-idle or reverse direction of the one or the other (or let
  *     userspace decide which resolution strategy shall be chosen/preferred)
@@ -518,6 +519,7 @@ enum gp_registers {
 #define GP_CH3_MODE_STR_FMT_8BPP_INDEX	( 1 << 24)
 #define GP_CH3_MODE_STR_FMT_8BPP_ALPHA	( 2 << 24) /* (A) */
 #define GP_CH3_MODE_STR_FMT_16BPP_4444	( 4 << 24)
+#define GP_CH3_MODE_STR_FMT_16BPP_1555	( 5 << 24) /* undocumented */
 #define GP_CH3_MODE_STR_FMT_16BPP_0565	( 6 << 24)
 #define GP_CH3_MODE_STR_FMT_YUV_422	( 7 << 24)
 #define GP_CH3_MODE_STR_FMT_32BPP_8888	( 8 << 24)
