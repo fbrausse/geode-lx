@@ -302,9 +302,6 @@ union lx_cmd {
 	} data;
 };
 
-/* let the compiler help: scream when a command type is unhandled */
-#define lx_cmd_type(cmd)	((enum lx_cmd_type)(cmd)->head.type)
-
 /* part of lx_i2c.c */
 extern bool lx_ddc_probe(struct i2c_adapter *ddc);
 extern int  lx_ddc_init(struct drm_device *dev);
@@ -339,11 +336,13 @@ extern void lx_ddc_cleanup(struct drm_device *dev);
 
 /* These form the upper six bits of the MSR address for the respective
  * component for outgoing r/w requests from the CPU core */
-#define LX_MC				0x20 /* memory controller */
-#define LX_GLCP				0x4c /* GeodeLink control processor */
-#define LX_VP				0x48 /* video processor */
-#define LX_GP				0xa0 /* graphics processor */
-#define LX_MSR(gldev, adr)		((gldev) << 24 | (adr & 0xffff))
+#define LX_GLIU0			0x1000
+#define LX_GLIU1			0x4000
+#define LX_MC				0x2000 /* memory controller */
+#define LX_GLCP				0x4c00 /* GeodeLink control processor */
+#define LX_VP				0x4800 /* video processor */
+#define LX_GP				0xa000 /* graphics processor */
+#define LX_MSR(gldev, adr)		((gldev) << 16 | (adr & 0xffff))
 
 /* used in GLIU P2D descriptors */
 #define LX_GLIU0_DID_GLIU		0
@@ -366,6 +365,7 @@ extern void lx_ddc_cleanup(struct drm_device *dev);
 #define LX_GLD_MSR_SMI			0x2002
 #define LX_GLD_MSR_ERROR		0x2003
 #define LX_GLD_MSR_PM			0x2004
+#define LX_GLD_MSR_DIAG			0x2005
 
 /* device specific MSRs */
 #define MSR_VP_DIAG			LX_MSR(LX_VP  , 0x2010)
@@ -446,26 +446,26 @@ enum gp_registers {
 	GP_INT_CNTRL, /* 0x78 */
 };
 
-#define GP_BLT_MODE_CP                  (1 << 11) /* interrupt when BLT done */
-#define GP_BLT_MODE_TH                  (1 << 10) /* begin BLT at next VBLANK */
+#define GP_BLT_MODE_CP			(1 << 11) /* interrupt when BLT done */
+#define GP_BLT_MODE_TH			(1 << 10) /* begin BLT at next VBLANK */
 #define GP_BLT_MODE_X_REVERSE		(1 << 9) /* negative increment for x */
 #define GP_BLT_MODE_Y_REVERSE		(1 << 8) /* negative increment for y */
-#define GP_BLT_MODE_SM_MONO_PACK        (2 << 6) /* src is byte-packed mono */
-#define GP_BLT_MODE_SM_MONO_UNPACK      (1 << 6) /* src is unpacked mono */
-#define GP_BLT_MODE_SM_COL              (0 << 6) /* src is color bitmap */
-#define GP_BLT_MODE_DR                  (1 << 2) /* dst data from fb required */
-#define GP_BLT_MODE_SR_HOST             (2 << 0) /* src data from GP_HST_SRC */
-#define GP_BLT_MODE_SR_FB               (1 << 0) /* src data from framebuffer */
-#define GP_BLT_MODE_SR_NONE             (0 << 0) /* no src data required */
+#define GP_BLT_MODE_SM_MONO_PACK	(2 << 6) /* src is byte-packed mono */
+#define GP_BLT_MODE_SM_MONO_UNPACK	(1 << 6) /* src is unpacked mono */
+#define GP_BLT_MODE_SM_COL		(0 << 6) /* src is color bitmap */
+#define GP_BLT_MODE_DR			(1 << 2) /* dst data from fb required */
+#define GP_BLT_MODE_SR_HOST		(2 << 0) /* src data from GP_HST_SRC */
+#define GP_BLT_MODE_SR_FB		(1 << 0) /* src data from framebuffer */
+#define GP_BLT_MODE_SR_NONE		(0 << 0) /* no src data required */
 
-#define GP_BLT_STATUS_UF                (1 << 7) /* channel 3 underflow */
-#define GP_BLT_STATUS_RP                (1 << 6) /* GP has read pending */
-#define GP_BLT_STATUS_EH                (1 << 5) /* host data expected */
-#define GP_BLT_STATUS_CE                (1 << 4) /* cmd buf empty */
-#define GP_BLT_STATUS_SHE               (1 << 3) /* src host FIFO half empty */
-#define GP_BLT_STATUS_PP                (1 << 2) /* primitive pending */
-#define GP_BLT_STATUS_IN                (1 << 1) /* GP interrupt signal */
-#define GP_BLT_STATUS_PB                (1 << 0) /* primitive busy */
+#define GP_BLT_STATUS_UF		(1 << 7) /* channel 3 underflow */
+#define GP_BLT_STATUS_RP		(1 << 6) /* GP has read pending */
+#define GP_BLT_STATUS_EH		(1 << 5) /* host data expected */
+#define GP_BLT_STATUS_CE		(1 << 4) /* cmd buf empty */
+#define GP_BLT_STATUS_SHE		(1 << 3) /* src host FIFO half empty */
+#define GP_BLT_STATUS_PP		(1 << 2) /* primitive pending */
+#define GP_BLT_STATUS_IN		(1 << 1) /* GP interrupt signal */
+#define GP_BLT_STATUS_PB		(1 << 0) /* primitive busy */
 
 #define GP_RESET_RESET			(0x69 << 24)
 

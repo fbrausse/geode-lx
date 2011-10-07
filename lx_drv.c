@@ -639,12 +639,12 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 		pat = ((u32 *)(info->pseudo_palette))[pat];
 
 	blt_mode = GP_BLT_MODE_SR_NONE;
-	dst_off  = info->fix.smem_start;
-	dst_off += dy * stride;
-	dst_off += dx * bpp / 8;
 
-	base_off = dst_off & 0xff000000;
-	dst_off &= ~0xff000000;
+	dst_off  = info->fix.smem_start;
+	base_off = dst_off & 0xffc00000;
+	dst_off += dy * stride;
+	dst_off += dx * ALIGN(bpp, 8) / 8;
+	dst_off -= base_off;
 
 	switch (region->rop) {
 	default:
@@ -661,9 +661,12 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 	switch (bpp) {
 	case  8:
 		raster |= GP_RASTER_MODE_FMT_0332;
+		pat |= pat << 8;
+		pat |= pat << 16;
 		break;
 	case 16:
 		raster |= GP_RASTER_MODE_FMT_0565;
+		pat |= pat << 16;
 		break;
 	case 24:
 	case 32:
@@ -798,7 +801,7 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 	u32 dx = image->dx, dy = image->dy;
 	u32 w = image->width, h = image->height;
 	u32 blt_mode, base_off, dst_off, bpp, stride, fg, bg, raster;
-	u32 ch3_mode, img_stride;
+	u32 ch3_mode, img_stride, img_bpp;
 
 	if (info->state != FBINFO_STATE_RUNNING)
 		return;
@@ -819,30 +822,24 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 	stride = info->fix.line_length;
 	bpp = info->var.bits_per_pixel;
 
-	raster = 0xcc; /* source copy */
-	switch (bpp) {
-	case  8:
-		raster |= GP_RASTER_MODE_FMT_0332;
-		break;
-	case 16:
-		raster |= GP_RASTER_MODE_FMT_0565;
-		break;
-	case 24:
-	case 32:
-		raster |= GP_RASTER_MODE_FMT_8888;
-		break;
-	}
-
-	base_off = info->fix.smem_start & 0xff000000;
-	dst_off = info->fix.smem_start & ~0xff000000;
+	dst_off = info->fix.smem_start;
+	base_off = dst_off & 0xffc00000;
 	dst_off += dy * stride;
 	dst_off += dx * ALIGN(bpp, 8) / 8;
+	dst_off -= base_off;
 
 	blt_mode = 0;
 	ch3_mode = 0;
+	img_bpp = image->depth;
 
 	switch (image->depth) {
 	case 1:
+		fg = image->fg_color;
+		bg = image->bg_color;
+		if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
+			fg = ((u32 *)(info->pseudo_palette))[fg];
+			bg = ((u32 *)(info->pseudo_palette))[bg];
+		}
 		break;
 	case 4:
 		ch3_mode |= GP_CH3_MODE_STR_FMT_4BPP_INDEX;
@@ -852,6 +849,7 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 		break;
 	case 15:
 		ch3_mode |= GP_CH3_MODE_STR_FMT_16BPP_1555;
+		img_bpp = 16;
 		break;
 	case 16:
 		ch3_mode |= GP_CH3_MODE_STR_FMT_16BPP_0565;
@@ -867,24 +865,45 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 		return;
 	}
 
-	img_stride = w * ALIGN(image->depth, 8) / 8;
+	raster = 0xcc; /* source copy */
+	switch (bpp) {
+	case  8:
+		raster |= GP_RASTER_MODE_FMT_0332;
+		fg |= fg << 8;
+		fg |= fg << 16;
+		bg |= bg << 8;
+		bg |= bg << 16;
+		break;
+	case 16:
+		raster |= GP_RASTER_MODE_FMT_0565;
+		fg |= fg << 16;
+		bg |= bg << 16;
+		break;
+	case 24:
+	case 32:
+		raster |= GP_RASTER_MODE_FMT_8888;
+		break;
+	}
+
+	img_stride = ALIGN(w * img_bpp, 8) / 8;
+
+#if 0
+	DRM_DEBUG_DRIVER("bpp: %u, stride: %u, img depth: %u, %ux%u -> %u,%u "
+			 "stride: %u, base: 0x%08x, dst: 0x%06x\n",
+			 bpp, stride, image->depth, w, h, dx, dy,
+			 img_stride, base_off, dst_off);
+#endif
 
 	lx_cmd_init(&cmd, LX_CMD_TYPE_BLT);
-	cmd.blt.post.dcount = h * img_stride;
+	cmd.blt.head.stall = 1;
+	cmd.blt.post.dcount = ALIGN(h * img_stride, 4);
 
 	if (image->depth == 1) {
 		/* setup old source channel */
-		blt_mode |= GP_BLT_MODE_SM_MONO_PACK;
 		blt_mode |= GP_BLT_MODE_SR_HOST;
+		blt_mode |= GP_BLT_MODE_SM_MONO_PACK;
 
 		cmd.blt.post.dtype = CMD_DTYPE_SRC_TO_SRC_CH;
-
-		fg = image->fg_color;
-		bg = image->bg_color;
-		if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
-			fg = ((u32 *)(info->pseudo_palette))[fg];
-			bg = ((u32 *)(info->pseudo_palette))[bg];
-		}
 
 		lx_cmd_set(&cmd, GP_SRC_COLOR_FG, fg);
 		lx_cmd_set(&cmd, GP_SRC_COLOR_BG, bg);
@@ -904,12 +923,14 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 	// lx_gp_wait_idle(par, 0);
 
 	lx_cmd_set(&cmd, GP_RASTER_MODE, raster);
+	// lx_cmd_set(&cmd, GP_PAT_COLOR_0, 0);
 
 	lx_cmd_set(&cmd, GP_CH3_MODE_STR, ch3_mode);
 	lx_cmd_set(&cmd, GP_BASE_OFFSET, base_off);
-	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off & ~0xff000000);
+	lx_cmd_set(&cmd, GP_SRC_OFFSET, 0);
+	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off);
 	lx_cmd_set(&cmd, GP_STRIDE, img_stride << 16 | stride); /* src and dst */
-	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0xffff) << 16 | (h & 0xffff));
+	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0x0fff) << 16 | (h & 0x0fff));
 
 	lx_cmd_set(&cmd, GP_BLT_MODE, blt_mode);
 
@@ -1047,7 +1068,8 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->flags = FBINFO_DEFAULT |
 		      FBINFO_HWACCEL_FILLRECT |
 		      FBINFO_HWACCEL_COPYAREA |
-		      FBINFO_HWACCEL_IMAGEBLIT;
+		      FBINFO_HWACCEL_IMAGEBLIT |
+	0;
 	info->fbops = &lx_fb_ops;
 
 	info->fix.smem_start = bo->map->offset;
