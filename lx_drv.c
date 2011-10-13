@@ -29,7 +29,7 @@ static void lx_crtc_fb_gamma_get(struct drm_crtc *crtc, u16 *red, u16 *green,
  * It is nearly identical to the one in drivers/video/geode/lxfb_ops.c with the
  * exceptions being the values for 106.5 and 341.349 MHz missing there */
 static struct {
-	/* resulting dot freq = 48 MHz * (N + 1) / ((M + 1) * (P + 1))
+	/* resulting dot freq = 48 MHz / (M + 1) * (N + 1) / (P + 1)
 	 * minimum pll freq (not post-divided by 4) is 15 MHz */
 	u32 pllval;   /* [16]   : divide output by 4 (unused in this table) */
 	              /* [14:12]: input clock divisor (M) */
@@ -270,13 +270,14 @@ static bool lx_cmd_buffer_empty(struct lx_priv *priv)
 	return !!(read_gp(priv, GP_BLT_STATUS) & GP_BLT_STATUS_CE);
 }
 
-static void lx_cmd_commit_locked(struct lx_priv *priv)
+static inline void lx_cmd_commit_locked(struct lx_priv *priv)
 {
+	wmb();
 	write_gp(priv, GP_CMD_WRITE, priv->cmd_write * 4);
 }
 
 /* count is in dwords */
-static void lx_cmd_write_locked(struct lx_priv *priv, const u32 *data,
+static inline void lx_cmd_write_locked(struct lx_priv *priv, const u32 *data,
 				unsigned count)
 {
 	unsigned wr = priv->cmd_write;
@@ -300,14 +301,14 @@ static const struct lx_cmd_data wrap_cmd = {
 	}
 };
 
-static void lx_cmd_flush_locked(struct lx_priv *priv)
+static inline void lx_cmd_flush_locked(struct lx_priv *priv)
 {
 	lx_cmd_write_locked(priv, (u32 *)&wrap_cmd, sizeof(wrap_cmd) / 4);
 	priv->cmd_write = 0;
 	lx_cmd_commit_locked(priv);
 }
 
-static void lx_cmd_enqueue(struct lx_priv *priv, const union lx_cmd *cmd,
+static inline void lx_cmd_enqueue(struct lx_priv *priv, const union lx_cmd *cmd,
 			   const u32 *post_data)
 {
 	const struct lx_cmd_post *post = NULL;
@@ -338,6 +339,8 @@ static void lx_cmd_enqueue(struct lx_priv *priv, const union lx_cmd *cmd,
 		post_enabled = (cmd->head.write_enables & (1 << post_off)) &&
 			       post->dcount;
 	}
+
+	BUG_ON(!post_enabled ^ !post_data);
 
 	total = size / 4;
 	if (post_enabled) /* TODO: adding post-data's size may not be needed */
@@ -377,6 +380,8 @@ static void lx_cmd_enqueue(struct lx_priv *priv, const union lx_cmd *cmd,
 /* --------------------------------------------------------------------------
  * Buffer objects
  * -------------------------------------------------------------------------- */
+
+/* TODO: remove (need for) lx_mm_alloc_{at,end}() */
 
 /* this one (and drm_mm_hole_node_start) should really be public ... */
 static inline unsigned long _drm_mm_hole_node_end(struct drm_mm_node *hole_node)
@@ -595,7 +600,7 @@ static int lx_sync(struct fb_info *info)
 	unsigned i;
 	u32 tmp;
 
-	for (i = 0; i < 1000; i++) {
+	for (i = 0; i < 150000; i++) {
 		tmp = read_gp(priv, GP_BLT_STATUS);
 		if (tmp & (GP_BLT_STATUS_PB | GP_BLT_STATUS_PP))
 			continue;
@@ -661,12 +666,9 @@ static void lx_fillrect(struct fb_info *info, const struct fb_fillrect *region)
 	switch (bpp) {
 	case  8:
 		raster |= GP_RASTER_MODE_FMT_0332;
-		pat |= pat << 8;
-		pat |= pat << 16;
 		break;
 	case 16:
 		raster |= GP_RASTER_MODE_FMT_0565;
-		pat |= pat << 16;
 		break;
 	case 24:
 	case 32:
@@ -745,8 +747,8 @@ static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 		dst_off += dx * bpp / 8;
 	}
 
-	dst_off -= ((base_off >> 22) & 0x3ff) << 22;
-	src_off -= ((base_off >>  2) & 0x3ff) << 22;
+	dst_off &= ~(((base_off >> 22) & 0x3ff) << 22);
+	src_off &= ~(((base_off >>  2) & 0x3ff) << 22);
 
 	raster = 0xcc; /* ROP: source copy */
 	switch (bpp) {
@@ -763,6 +765,9 @@ static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 		raster |= GP_RASTER_MODE_FMT_8888;
 		ch3_mode |= GP_CH3_MODE_STR_FMT_32BPP_8888;
 		break;
+	default:
+		DRM_ERROR("invalid bpp for copyarea: %d\n", bpp);
+		return;
 	}
 
 	lx_cmd_init(&cmd, LX_CMD_TYPE_BLT);
@@ -792,16 +797,19 @@ static void lx_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 	lx_cmd_enqueue(priv, &cmd, NULL);
 }
 
+#define LX_IMAGEBLIT_DIRECT	0
+
 static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 {
 	struct lx_fb *lfb = helper_to_lx_fb(info->par);
 	struct lx_priv *priv = lfb->priv;
 	union lx_cmd cmd;
+	int i;
 
 	u32 dx = image->dx, dy = image->dy;
 	u32 w = image->width, h = image->height;
 	u32 blt_mode, base_off, dst_off, bpp, stride, fg, bg, raster;
-	u32 ch3_mode, img_stride, img_bpp;
+	u32 ch3_mode, img_stride, img_bpp, ch3_off, src_off;
 
 	if (info->state != FBINFO_STATE_RUNNING)
 		return;
@@ -823,10 +831,10 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 	bpp = info->var.bits_per_pixel;
 
 	dst_off = info->fix.smem_start;
-	base_off = dst_off & 0xffc00000;
+	base_off = ((dst_off >> 22) & 0x3ff) << 22;
 	dst_off += dy * stride;
 	dst_off += dx * ALIGN(bpp, 8) / 8;
-	dst_off -= base_off;
+	dst_off -= base_off & (0x3ff << 22);
 
 	blt_mode = 0;
 	ch3_mode = 0;
@@ -834,12 +842,6 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 
 	switch (image->depth) {
 	case 1:
-		fg = image->fg_color;
-		bg = image->bg_color;
-		if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
-			fg = ((u32 *)(info->pseudo_palette))[fg];
-			bg = ((u32 *)(info->pseudo_palette))[bg];
-		}
 		break;
 	case 4:
 		ch3_mode |= GP_CH3_MODE_STR_FMT_4BPP_INDEX;
@@ -869,15 +871,9 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 	switch (bpp) {
 	case  8:
 		raster |= GP_RASTER_MODE_FMT_0332;
-		fg |= fg << 8;
-		fg |= fg << 16;
-		bg |= bg << 8;
-		bg |= bg << 16;
 		break;
 	case 16:
 		raster |= GP_RASTER_MODE_FMT_0565;
-		fg |= fg << 16;
-		bg |= bg << 16;
 		break;
 	case 24:
 	case 32:
@@ -885,25 +881,35 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 		break;
 	}
 
-	img_stride = ALIGN(w * img_bpp, 8) / 8;
-
-#if 0
-	DRM_DEBUG_DRIVER("bpp: %u, stride: %u, img depth: %u, %ux%u -> %u,%u "
-			 "stride: %u, base: 0x%08x, dst: 0x%06x\n",
-			 bpp, stride, image->depth, w, h, dx, dy,
-			 img_stride, base_off, dst_off);
-#endif
-
 	lx_cmd_init(&cmd, LX_CMD_TYPE_BLT);
 	cmd.blt.head.stall = 1;
+
+	img_stride = ALIGN(w * img_bpp, 8) / 8;
+
+#if !LX_IMAGEBLIT_DIRECT
 	cmd.blt.post.dcount = ALIGN(h * img_stride, 4);
+#endif
+
+	src_off = 0;
 
 	if (image->depth == 1) {
 		/* setup old source channel */
-		blt_mode |= GP_BLT_MODE_SR_HOST;
 		blt_mode |= GP_BLT_MODE_SM_MONO_PACK;
+#if LX_IMAGEBLIT_DIRECT
+		blt_mode |= GP_BLT_MODE_SR_FB;
 
-		cmd.blt.post.dtype = CMD_DTYPE_SRC_TO_SRC_CH;
+		src_off = virt_to_phys((volatile void *)image->data);
+		base_off |= ((src_off >> 22) & 0x3ff) << 12;
+		src_off &= ~(0x3ff << 22);
+#else
+		blt_mode |= GP_BLT_MODE_SR_HOST;
+#endif
+		fg = image->fg_color;
+		bg = image->bg_color;
+		if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
+			fg = ((u32 *)(info->pseudo_palette))[fg];
+			bg = ((u32 *)(info->pseudo_palette))[bg];
+		}
 
 		lx_cmd_set(&cmd, GP_SRC_COLOR_FG, fg);
 		lx_cmd_set(&cmd, GP_SRC_COLOR_BG, bg);
@@ -913,65 +919,81 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 
 		ch3_mode |= GP_CH3_MODE_STR_EN;
 		ch3_mode |= GP_CH3_MODE_STR_PS_SOURCE;
-		/* LUT for CH3 and indexed modes? */
-		ch3_mode |= GP_CH3_MODE_STR_HS;
+		/* TODO: LUT for CH3 and indexed modes, -> image->fb_cmap */
 		ch3_mode |= img_stride;
 
-		cmd.blt.post.dtype = CMD_DTYPE_SRC_TO_CH3;
+#if LX_IMAGEBLIT_DIRECT
+		ch3_off = virt_to_phys((volatile void *)image->data);
+		base_off |= ((ch3_off >> 22) & 0x3ff) <<  2;
+		ch3_off &= ~(0x3ff << 22);
+
+		lx_cmd_set(&cmd, GP_CH3_OFFSET, ch3_off);
+#else
+		ch3_mode |= GP_CH3_MODE_STR_HS;
+#endif
 	}
 
-	// lx_gp_wait_idle(par, 0);
+#if 0
+	DRM_DEBUG_DRIVER("bpp: %u, stride: %u, img depth: %u, %ux%u -> %u,%u "
+			 "stride: %u, base: 0x%08x, src: 0x%06x, dst: 0x%06x, "
+			 "total: %u, data phys: 0x%08x\n",
+			 bpp, stride, image->depth, w, h, dx, dy,
+			 img_stride, base_off, src_off, dst_off,
+			 cmd.blt.post.dcount, virt_to_phys((volatile void *)image->data));
+#endif
 
 	lx_cmd_set(&cmd, GP_RASTER_MODE, raster);
-	// lx_cmd_set(&cmd, GP_PAT_COLOR_0, 0);
 
 	lx_cmd_set(&cmd, GP_CH3_MODE_STR, ch3_mode);
 	lx_cmd_set(&cmd, GP_BASE_OFFSET, base_off);
-	lx_cmd_set(&cmd, GP_SRC_OFFSET, 0);
+	lx_cmd_set(&cmd, GP_SRC_OFFSET, src_off);
 	lx_cmd_set(&cmd, GP_DST_OFFSET, dst_off);
 	lx_cmd_set(&cmd, GP_STRIDE, img_stride << 16 | stride); /* src and dst */
 	lx_cmd_set(&cmd, GP_WID_HEIGHT, (w & 0x0fff) << 16 | (h & 0x0fff));
 
 	lx_cmd_set(&cmd, GP_BLT_MODE, blt_mode);
 
-	lx_cmd_enqueue(priv, &cmd, (const void *)image->data);
-
-#if 0
-	/* wait for this operation to start */
-	do {
-		j = read_gp(par, GP_BLT_STATUS);
-	} while (!(j & GP_BLT_STATUS_PB));
-
-	i = w * h;
-	while (1) {
-		while (!(j & GP_BLT_STATUS_SHE));
-			j = read_gp(par, GP_BLT_STATUS);
-		for (j=8; j; j--) {
-			write_gp(par, GP_HST_SRC, *src++);
-			i -= 32;
-			if (i < 0) {
-				lx_gp_wait_idle(par, 0);
-				return;
-			}
-		}
-		j = read_gp(par, GP_BLT_STATUS);
+#if LX_IMAGEBLIT_DIRECT
+	lx_cmd_enqueue(priv, &cmd, NULL);
+	for (i=0; i<1000; i++) {
+		if (read_gp(priv, GP_BLT_STATUS) & (GP_BLT_STATUS_PB | GP_BLT_STATUS_PP | GP_BLT_STATUS_RP))
+			continue;
+		break;
 	}
+#else
+	lx_cmd_enqueue(priv, &cmd, (const void *)image->data);
 #endif
 }
+
+#define LX_FBDEV_FILLRECT	1
+#define LX_FBDEV_COPYAREA	1
+#define LX_FBDEV_IMAGEBLT	1
 
 static struct fb_ops lx_fb_ops = {
 	.owner = THIS_MODULE,
 	.fb_check_var = drm_fb_helper_check_var,
 	.fb_set_par = drm_fb_helper_set_par,
+#if LX_FBDEV_FILLRECT
 	.fb_fillrect = lx_fillrect,
+#else
+	.fb_fillrect = cfb_fillrect,
+#endif
+#if LX_FBDEV_COPYAREA
 	.fb_copyarea = lx_copyarea,
+#else
+	.fb_copyarea = cfb_copyarea,
+#endif
+#if LX_FBDEV_IMAGEBLT
 	.fb_imageblit = lx_imageblit,
+#else
+	.fb_imageblit = cfb_imageblit,
+#endif
 	.fb_pan_display = drm_fb_helper_pan_display,
 	.fb_blank = drm_fb_helper_blank,
 	.fb_setcmap = drm_fb_helper_setcmap,
 	.fb_debug_enter = drm_fb_helper_debug_enter,
 	.fb_debug_leave = drm_fb_helper_debug_leave,
-	// .fb_sync = lx_sync,
+	.fb_sync = lx_sync,
 };
 
 /* pitch needs to be aligned to qword boundary */
@@ -1066,9 +1088,16 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	drm_fb_helper_fill_fix(info, fb->pitch, fb->depth);
 
 	info->flags = FBINFO_DEFAULT |
+#if LX_FBDEV_FILLRECT
 		      FBINFO_HWACCEL_FILLRECT |
+#endif
+#if LX_FBDEV_COPYAREA
 		      FBINFO_HWACCEL_COPYAREA |
+		      // FBINFO_READS_FAST |
+#endif
+#if LX_FBDEV_IMAGEBLT
 		      FBINFO_HWACCEL_IMAGEBLIT |
+#endif
 	0;
 	info->fbops = &lx_fb_ops;
 
@@ -1126,7 +1155,7 @@ static int lx_fbdev_init(struct drm_device *dev)
 {
 	struct lx_priv *priv = dev->dev_private;
 	struct lx_fb *lfb;
-	int bpp = 8;
+	int bpp = 32;
 	int ret;
 
 	DRM_DEBUG_DRIVER("\n");
@@ -3303,51 +3332,51 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 
 	/* this should be protected by disabled IRQs */
 	{
-		dc_irq = read_dc(priv, DC_IRQ);
-		gp_irq = read_gp(priv, GP_INT_CNTRL);
+	dc_irq = read_dc(priv, DC_IRQ);
+	gp_irq = read_gp(priv, GP_INT_CNTRL);
 
-		dc_irq &= ~(dc_irq << 16); /* clear all masked interrupts */
-		gp_irq &= ~(gp_irq << 16); /* clear all masked interrupts */
+	// dc_irq &= ~(dc_irq << 16); /* clear all masked interrupts */
+	// gp_irq &= ~(gp_irq << 16); /* clear all masked interrupts */
+	}
 
-		if (dc_irq & LX_IRQ_STATUS_MASK) {
-			/* some of DC's IRQ status bits seem to be enabled */
-			dc_unlock(priv);
-			write_dc(priv, DC_IRQ, dc_irq); /* clear DC IRQ status */
-			dc_lock(priv);
+	if (dc_irq & LX_IRQ_STATUS_MASK) {
+		/* some of DC's IRQ status bits seem to be enabled */
+		dc_unlock(priv);
+		write_dc(priv, DC_IRQ, dc_irq); /* clear DC IRQ status */
+		dc_lock(priv);
 
-			ret = IRQ_HANDLED;
+		if (dc_irq & DC_IRQ_STATUS) {
+			/* programmed line counter value (0) has been reached by the DC,
+			 * so the beginning of the scanout buffer */
+
+			/* need to get the timestamp first as the do_page_flip code may
+			 * already depend on it to send back to userspace */
+			do_gettimeofday(&priv->last_vblank);
+
+			/* process possibly pending page flip */
+			lx_crtc_do_page_flip(&priv->crtcs[LX_CRTC_GRAPHIC].base);
+
+			drm_handle_vblank(dev, LX_CRTC_GRAPHIC);
+		}
+		if (dc_irq & DC_IRQ_VIP_VSYNC_IRQ_STATUS) {
 		}
 
-		if (gp_irq & LX_IRQ_STATUS_MASK) {
-			/* some of GP's IRQ status bits seem to be enabled */
-			write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
+		ret = IRQ_HANDLED;
+	}
 
-			ret = IRQ_HANDLED;
+	if (gp_irq & LX_IRQ_STATUS_MASK) {
+		/* some of GP's IRQ status bits seem to be enabled */
+		write_gp(priv, GP_INT_CNTRL, gp_irq); /* clear GP IRQ status */
+
+		if (gp_irq & GP_INT_IDLE_STATUS) {
+		}
+		if (gp_irq & GP_INT_CMD_BUF_EMPTY_STATUS) {
+		}
 #if 0
-			DRM_DEBUG_DRIVER("gp irq: %08x\n", gp_irq);
+		DRM_DEBUG_DRIVER("gp irq: %08x\n", gp_irq);
 #endif
-		}
-	}
 
-	if (dc_irq & DC_IRQ_STATUS) {
-		/* programmed line counter value (0) has been reached by the DC,
-		 * so the beginning of the scanout buffer */
-
-		/* need to get the timestamp first as the do_page_flip code may
-		 * already depend on it to send back to userspace */
-		do_gettimeofday(&priv->last_vblank);
-
-		/* process possibly pending page flip */
-		lx_crtc_do_page_flip(&priv->crtcs[LX_CRTC_GRAPHIC].base);
-
-		drm_handle_vblank(dev, LX_CRTC_GRAPHIC);
-	}
-	if (dc_irq & DC_IRQ_VIP_VSYNC_IRQ_STATUS) {
-	}
-
-	if (gp_irq & GP_INT_IDLE_STATUS) {
-	}
-	if (gp_irq & GP_INT_CMD_BUF_EMPTY_STATUS) {
+		ret = IRQ_HANDLED;
 	}
 
 	return ret;
@@ -3421,8 +3450,8 @@ static int lx_driver_irq_postinstall(struct drm_device *dev)
 
 	irq = read_gp(priv, GP_INT_CNTRL);
 	irq &= ~LX_IRQ_STATUS_MASK;
-	irq &= ~GP_INT_IDLE_MASK;
-	irq &= ~GP_INT_CMD_BUF_EMPTY_MASK;
+	irq |= GP_INT_IDLE_MASK;
+	irq |= GP_INT_CMD_BUF_EMPTY_MASK;
 	write_gp(priv, GP_INT_CNTRL, irq);
 
 	return 0;

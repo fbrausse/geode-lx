@@ -39,6 +39,7 @@
  *   - check & accept the 4 types of commands
  *   - any driver-specific commands necessary?
  *     - init: command buffer size, compression allowed
+ *     - flush
  *   - check for overlapping areas of subsequent blits and either reschedule or
  *     wait for gp-idle or reverse direction of the one or the other (or let
  *     userspace decide which resolution strategy shall be chosen/preferred)
@@ -46,7 +47,6 @@
  *     - needs page-size to be a multiple of pitch for source buffer(s) when
  *       spanning multiple (non-contiguous) pages & offset to page-size alignment
  *       -> mmap'ed buffers only?
- *   - flush
  * - video overlay
  * 
  * client.c:
