@@ -225,6 +225,8 @@ struct lx_priv {
 	struct drm_mm_node *cmd_buf_node;
 	u32 cmd_write; /* index into cmd_buf */
 	u32 __iomem *cmd_buf;
+	unsigned last_blt_ch3 : 1;
+	unsigned last_blt_src : 1;
 };
 
 enum lx_cmd_type {
@@ -454,6 +456,7 @@ enum gp_registers {
 #define GP_BLT_MODE_SM_MONO_UNPACK	(1 << 6) /* src is unpacked mono */
 #define GP_BLT_MODE_SM_COL		(0 << 6) /* src is color bitmap */
 #define GP_BLT_MODE_DR			(1 << 2) /* dst data from fb required */
+#define GP_BLT_MODE_SR_MASK		(3 << 0)
 #define GP_BLT_MODE_SR_HOST		(2 << 0) /* src data from GP_HST_SRC */
 #define GP_BLT_MODE_SR_FB		(1 << 0) /* src data from framebuffer */
 #define GP_BLT_MODE_SR_NONE		(0 << 0) /* no src data required */

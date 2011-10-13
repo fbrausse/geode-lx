@@ -272,7 +272,16 @@ static bool lx_cmd_buffer_empty(struct lx_priv *priv)
 
 static inline void lx_cmd_commit_locked(struct lx_priv *priv)
 {
-	wmb();
+	u32 r, w;
+
+	mb();
+#if 0
+	w = read_gp(priv, GP_CMD_WRITE);
+	if (priv->cmd_write * 4 > w)
+		do {
+			r = read_gp(priv, GP_CMD_READ);
+		} while (w < r && priv->cmd_write * 4 >= r);
+#endif
 	write_gp(priv, GP_CMD_WRITE, priv->cmd_write * 4);
 }
 
@@ -315,6 +324,7 @@ static inline void lx_cmd_enqueue(struct lx_priv *priv, const union lx_cmd *cmd,
 	bool post_enabled = false;
 	/* in bytes, including head and potentially existing post */
 	unsigned size, total, left;
+	bool wait;
 
 	switch (cmd->head.type) {
 	case LX_CMD_TYPE_BLT:
@@ -357,8 +367,38 @@ static inline void lx_cmd_enqueue(struct lx_priv *priv, const union lx_cmd *cmd,
 	if (total > left) {
 		/* explicitely wrap the command buffer by a dummy data packet,
 		 * because the spec is quite unclear about how auto-wrapping
-		 * should work and I haven't been able to figure it out by trial
-		 * and error */
+		 * should work and I haven't been able to figure it out through
+		 * trial and error */
+
+		if (cmd->head.type == LX_CMD_TYPE_BLT) {
+			if (cmd->blt.ch3_mode_str & GP_CH3_MODE_STR_EN) {
+				wait = true;
+				priv->last_blt_ch3 = true;
+				priv->last_blt_src = false;
+			} else if ((cmd->blt.blt_mode & GP_BLT_MODE_SR_MASK) != GP_BLT_MODE_SR_NONE) {
+				wait = true;
+				priv->last_blt_ch3 = false;
+				priv->last_blt_src = true;
+			} else {
+				wait = false;
+				priv->last_blt_ch3 = false;
+				priv->last_blt_src = false;
+			}
+			if (wait) {
+				int i;
+				u32 st, r0 = read_gp(priv, GP_CMD_READ), w = read_gp(priv, GP_CMD_WRITE);
+				for (i=0; i<1000000; i++) {
+					st = read_gp(priv, GP_BLT_STATUS);
+					if (st & (/*GP_BLT_STATUS_PB |*/ GP_BLT_STATUS_PP))
+						continue;
+					if (!(st & GP_BLT_STATUS_CE))
+						continue;
+					break;
+				}
+				if (i)
+					DRM_DEBUG_DRIVER("status: %08x, rd0: %08x, rd1: %08x, wr: %08x, i: %d\n", st, r0, read_gp(priv, GP_CMD_READ), w, i);
+			}
+		}
 		lx_cmd_flush_locked(priv);
 	}
 
@@ -600,7 +640,7 @@ static int lx_sync(struct fb_info *info)
 	unsigned i;
 	u32 tmp;
 
-	for (i = 0; i < 150000; i++) {
+	for (i = 0; i < 250000; i++) {
 		tmp = read_gp(priv, GP_BLT_STATUS);
 		if (tmp & (GP_BLT_STATUS_PB | GP_BLT_STATUS_PP))
 			continue;
@@ -882,7 +922,7 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 	}
 
 	lx_cmd_init(&cmd, LX_CMD_TYPE_BLT);
-	cmd.blt.head.stall = 1;
+	// cmd.blt.head.stall = 1;
 
 	img_stride = ALIGN(w * img_bpp, 8) / 8;
 
@@ -1093,7 +1133,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 #endif
 #if LX_FBDEV_COPYAREA
 		      FBINFO_HWACCEL_COPYAREA |
-		      // FBINFO_READS_FAST |
+		      FBINFO_READS_FAST |
 #endif
 #if LX_FBDEV_IMAGEBLT
 		      FBINFO_HWACCEL_IMAGEBLIT |
