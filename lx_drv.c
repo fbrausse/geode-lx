@@ -389,7 +389,7 @@ static inline void lx_cmd_enqueue(struct lx_priv *priv, const union lx_cmd *cmd,
 				u32 st, r0 = read_gp(priv, GP_CMD_READ), w = read_gp(priv, GP_CMD_WRITE);
 				for (i=0; i<1000000; i++) {
 					st = read_gp(priv, GP_BLT_STATUS);
-					if (st & (/*GP_BLT_STATUS_PB |*/ GP_BLT_STATUS_PP))
+					if (st & (GP_BLT_STATUS_PP))
 						continue;
 					if (!(st & GP_BLT_STATUS_CE))
 						continue;
@@ -915,7 +915,7 @@ static void lx_imageblit(struct fb_info *info, const struct fb_image *image)
 	case 16:
 		raster |= GP_RASTER_MODE_FMT_0565;
 		break;
-	case 24:
+	case 24: /* TODO: unsupported, remove */
 	case 32:
 		raster |= GP_RASTER_MODE_FMT_8888;
 		break;
@@ -2158,7 +2158,6 @@ static const struct drm_crtc_funcs lx_crtc_funcs = {
 	 * completes, otherwise it will be NULL.
 	 */
 	.page_flip = lx_crtc_page_flip,
-	/* TODO: these need testing: */
 	.cursor_set = lx_crtc_cursor_set,
 	.cursor_move = lx_crtc_cursor_move,
 #if 0
@@ -3142,10 +3141,10 @@ static int lx_map_video_memory(struct drm_device *dev)
 		 (unsigned long)priv->vmem_addr,
 		 ~priv->vmem_phys ? tmp : "unknown");
 
-	ret = lx_command_buffer_init(priv, 1024 << 10);
+	ret = lx_command_buffer_init(priv, 64 << 10);
 	if (ret)
 		DRV_INFO("failed initializing command ring of size %u KB\n",
-			 1024);
+			 64);
 
 	return 0;
 
