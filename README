@@ -1,0 +1,49 @@
+Linux KMS driver for Geode LX
+-----------------------------
+
+Developed for and on my Flepo alpha PC, which is driven by the AMD Geode
+LX and its companion chip CS5536.
+
+It's available via git in this repository under the GPLv2 license.
+
+Up to now it can do modesetting, user-space notification of vertical
+blanking events and perform page-flipping. There is no support for DMA
+IOCTLs or the like, but the dumb buffer API for KMS is fully supported,
+currently through the use of the dumb memrange allocator drm_mm.
+
+Also so far it can acquire EDID data from a capable monitor connected via
+VGA and perform DAC load detection by driving the analog outputs with a
+pixel value just under half intensity and comparing the actual voltage
+level to a reference set to 0.35V by the manufacturer.
+
+Although the chip supports a flat panel connector, my Flepo PC doesn't have
+it wired up to anything, so I haven't been able to test that circutry and
+so far there is no support for either flat panels or the Video Output Port
+(which uses the same connector), but that should change in the future,
+as one of the developers of the "classic" X.org-driver xf86-video-geode
+on #geode on FreeNode owning an OLPC XO-1, that also features an AMD Geode
+(and a flat panel, of course), has offered to run tests. Thanks leio.
+
+The motivation behind this driver originated from the Pong I built for this
+board, featuring a (nice) variant of the 8051 microcontroller. It is driving
+the GPIOs to produce a valid VGA signal to be displayed on a regular monitor.
+
+Also the afore mentioned leio has pointed me to some performance issues
+their UMS driver currently has regarding EXA and some needless memory copy
+operations, that I hope to be able to alleviate through the KMS driver.
+
+Dave Airlie has been so kind to provide a new branch called restart for
+xf86-video-modesetting that not only compiles (unlike the original version
+of the driver), but also provides support for a hardware accelerated pointer
+using (only!) the KMS API. Using this driver, lx can already be tested, though
+no acceleration other than the cursor is available through the pure KMS API.
+Unfortunately as the kernel's DRM API still lacks a means to communicate
+the available/valid cursor dimensions/depths, xf86-video-modesetting needs
+patching to request only a 48x64 sizes cursor buffer as the kernel driver will
+deny any other surface sizes (due to the lack of hardware support).  However,
+I'm expecting this to change, as soon as an API for this has stabilized and
+landed in the kernel. A discussion of this matter may be found in this thread
+<http://lists.freedesktop.org/archives/dri-devel/2011-September/014680.html>
+on the dri-devel mailinglist.
+
+-- Franz Brauße <dev@karlchenofhell.org> 19.12.2010, 15:42
