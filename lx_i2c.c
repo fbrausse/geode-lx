@@ -4,8 +4,6 @@
 #include <linux/i2c-algo-bit.h>
 #include <drm/drm_edid.h>
 
-#include "drmP.h"
-
 #include "lx.h"
 
 #define GPIO_SCL 3
@@ -34,10 +32,10 @@ static struct i2c_algo_bit_data lx_ddc_bit_data = {
 	.getsda = lx_ddc_getsda,
 	.getscl = lx_ddc_getscl,
 	.udelay = 5,			/* 100 kHz */
-	.timeout = DRM_HZ / 10,		/* 100 ms */
+	.timeout = HZ / 10,		/* 100 ms */
 };
 
-/* copy of the non-exported function drm_probe_ddc() */
+/* copy of the non-exported function drm_probe_ddc(); TODO: it's exported now */
 bool lx_ddc_probe(struct i2c_adapter *ddc) {
 	int retries = 5;
 	u8 start = 0, out, ret;

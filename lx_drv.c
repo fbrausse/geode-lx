@@ -8,13 +8,22 @@
  * with code borrowed from i915 and radeon drivers.
  */
 
-#include <linux/vga_switcheroo.h>
 #include <linux/cs5535.h>
-#include <drm.h>
+#include <linux/delay.h>
+#include <linux/pci.h>
+#include <linux/vga_switcheroo.h>
 
-#include "drmP.h"
-#include "drm_crtc.h"
-#include "drm_crtc_helper.h"
+#include <drm/drm.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_edid.h>
+#include <drm/drm_file.h>
+#include <drm/drm_framebuffer.h>
+#include <drm/drm_ioctl.h>
+#include <drm/drm_modes.h>
+#include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
 
 #include "lx.h"
 
@@ -214,21 +223,32 @@ static struct drm_mm_node * lx_mm_alloc_at(struct lx_priv *priv, unsigned size,
 					   int best_match)
 {
 	struct drm_mm_node *node;
+	int ret;
 
 	/* TODO: do any of these calls need mutex protection? */
-	node = drm_mm_search_free_in_range(&priv->mman.mm, size, alignment,
-					   from, priv->vmem_size, best_match);
-	if (node)
-		node = drm_mm_get_block_range(node, size, alignment, from,
-					      priv->vmem_size);
+	/* TODO: super inefficient: store *node in whereever it's needed */
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		goto err_alloc;
+
+	ret = drm_mm_insert_node_in_range(&priv->mman.mm, node, size, alignment,
+	                                  0, from, priv->vmem_size,
+	                                  best_match ? DRM_MM_INSERT_BEST : 0);
+	if (ret < 0)
+		goto err_insert;
 
 	return node;
+
+err_insert:
+	kfree(node);
+err_alloc:
+	return NULL;
 }
 
 #define lx_mm_alloc(priv, size, alignment, best_match) \
 	lx_mm_alloc_at((priv), (size), (alignment), 0, (best_match))
 
-static int lx_bo_addmap(struct lx_priv *priv, struct lx_bo *bo)
+static int lx_bo_addmap(struct lx_priv * priv, struct lx_bo * bo)
 {
 	resource_size_t off;
 	int ret;
@@ -237,27 +257,24 @@ static int lx_bo_addmap(struct lx_priv *priv, struct lx_bo *bo)
 		return 0;
 
 	off = bo->node->start + priv->vmem_addr;
-	ret = drm_addmap(priv->ddev, off, bo->node->size, _DRM_FRAME_BUFFER,
-			 _DRM_WRITE_COMBINING | _DRM_DRIVER, &bo->map);
+	ret = drm_legacy_addmap(priv->ddev, off, bo->node->size,
+	                        _DRM_FRAME_BUFFER,
+	                        _DRM_WRITE_COMBINING | _DRM_DRIVER, &bo->map);
 
 	return ret;
 }
 
 static int lx_bo_rmmap(struct lx_priv *priv, struct lx_bo *bo)
 {
-	int ret;
-
 	if (!bo->map)
 		return 0;
 
 	if (bo->map->handle) {
-		drm_core_ioremapfree(bo->map, priv->ddev);
+		drm_legacy_ioremapfree(bo->map, priv->ddev);
 		bo->map->handle = NULL;
 	}
 
-	ret = drm_rmmap(priv->ddev, bo->map);
-	if (ret)
-		return ret;
+	drm_legacy_rmmap(priv->ddev, bo->map);
 
 	bo->map = NULL;
 	return 0;
@@ -267,26 +284,27 @@ static struct lx_bo * lx_bo_create(struct drm_file *file_priv,
 				   struct drm_mm_node *node)
 {
 	struct lx_bo *bo;
-	int ret;
+	int ret = 0;
 
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
 	if (!bo)
 		return NULL;
 
 	if (file_priv) {
-		do {
-			if (!idr_pre_get(&file_priv->object_idr, GFP_KERNEL))
-				goto err;
-
-			spin_lock(&file_priv->table_lock);
-			ret = idr_get_new(&file_priv->object_idr, bo, &bo->id);
-			spin_unlock(&file_priv->table_lock);
-		} while (ret == -EAGAIN);
+		idr_preload(GFP_KERNEL);
+		spin_lock(&file_priv->table_lock);
+		ret = idr_alloc(&file_priv->object_idr, bo, 1, 0, GFP_NOWAIT);
+		spin_unlock(&file_priv->table_lock);
+		idr_preload_end();
 	}
 
-	if (ret == -ENOSPC)
+	if (ret < 0) {
+		if (ret == -ENOSPC)
+			DRV_ERR("too many BOs");
 		goto err;
+	}
 
+	bo->id = ret;
 	bo->node = node;
 	return bo;
 
@@ -308,15 +326,15 @@ static void lx_bo_destroy(struct lx_priv *priv, struct drm_file *file_priv,
 
 	ret = lx_bo_rmmap(priv, bo);
 	if (ret)
-		DRM_ERROR("removing local map for object %d, size: %lu @ %lx; %d\n",
+		DRM_ERROR("removing local map for object %d, size: %llu @ %llx; %d\n",
 			  bo->id, bo->node->size,
-			  (unsigned long)(bo->node->start + priv->vmem_addr), ret);
+			  bo->node->start + priv->vmem_addr, ret);
 
 	if (bo->free)
 		bo->free(priv, bo);
 
 	if (bo->node)
-		drm_mm_put_block(bo->node);
+		drm_mm_remove_node(bo->node);
 
 	kfree(bo);
 }
@@ -374,8 +392,8 @@ static struct drm_framebuffer_funcs lx_fb_funcs = {
 };
 
 static int lx_fb_init(struct lx_priv *priv, struct lx_fb *lfb,
-		       struct drm_mode_fb_cmd *mode_cmd,
-		       struct lx_bo *bo)
+		      const struct drm_mode_fb_cmd2 *mode_cmd,
+		      struct lx_bo *bo)
 {
 	int ret;
 
@@ -387,7 +405,7 @@ static int lx_fb_init(struct lx_priv *priv, struct lx_fb *lfb,
 		return ret;
 	}
 
-	drm_helper_mode_fill_fb_struct(&lfb->base, mode_cmd);
+	drm_helper_mode_fill_fb_struct(priv->ddev, &lfb->base, mode_cmd);
 
 	return 0;
 }
@@ -408,6 +426,10 @@ static struct fb_ops lx_fb_ops = {
 
 /* pitch needs to be aligned to qword boundary */
 #define lx_gfx_pitch_for(width, bpp)	ALIGN((width) * ALIGN((bpp), 8) / 8, 8)
+
+#ifndef CONFIG_DRM_FBDEV_EMULATION
+# error require CONFIG_DRM_FBDEV_EMULATION=y
+#endif
 
 /**
  * @sizes  init params for new fb object
@@ -464,7 +486,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	bo = lx_bo_create(NULL, node);
 	if (!bo) {
 		DRM_ERROR("creating bo for initial fbcon fb\n");
-		drm_mm_put_block(node);
+		drm_mm_remove_node(node);
 		return -ENOMEM;
 	}
 	ret = lx_bo_addmap(priv, bo);
@@ -472,7 +494,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 		DRM_ERROR("adding map for initial fbcon fb's bo: %d\n", ret);
 		goto err_bo_destroy;
 	}
-	drm_core_ioremap_wc(bo->map, priv->ddev);
+	drm_legacy_ioremap_wc(bo->map, priv->ddev);
 
 	mutex_lock(&dev->struct_mutex);
 
@@ -485,7 +507,24 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	info->par = helper;
 
-	ret = lx_fb_init(priv, lfb, &mode_cmd, bo);
+	/* TODO: use drm_driver_legacy_fb_format() instead to allow for quirks
+	 *       to be set? */
+	/* modelled mainly after logic in drm_mode_addfb() */
+	struct drm_mode_fb_cmd2 mode_cmd2 = {
+		.fb_id        = mode_cmd.fb_id,
+		.width        = mode_cmd.width,
+		.height       = mode_cmd.height,
+		.pixel_format = drm_mode_legacy_fb_format(mode_cmd.bpp, mode_cmd.depth),
+		.flags        = 0,
+		.pitches[0]   = mode_cmd.pitch,
+		.handles[0]   = mode_cmd.handle,
+	};
+	if (mode_cmd2.pixel_format == DRM_FORMAT_INVALID) {
+		DRM_DEBUG_DRIVER("bad {bpp:%d, depth:%d}\n", mode_cmd.bpp, mode_cmd.depth);
+		return -EINVAL;
+	}
+
+	ret = lx_fb_init(priv, lfb, &mode_cmd2, bo);
 	if (ret) {
 		DRM_ERROR("Failed to initialize drm_framebuffer: %d\n", ret);
 		goto err_unlock1;
@@ -495,10 +534,6 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	helper->fb = fb;
 	helper->fbdev = info;
 
-	strcpy(info->fix.id, "lxdrmfb");
-
-	drm_fb_helper_fill_fix(info, fb->pitch, fb->depth);
-
 	info->flags = FBINFO_DEFAULT /*| FBINFO_VIRTFB*/;
 	info->fbops = &lx_fb_ops;
 
@@ -507,7 +542,7 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->screen_base = bo->map->handle;
 	info->screen_size = size;
 
-	drm_fb_helper_fill_var(info, helper, sizes->fb_width, sizes->fb_height);
+	drm_fb_helper_fill_info(info, helper, sizes);
 
 	info->apertures = alloc_apertures(1);
 	if (info->apertures) {
@@ -528,8 +563,8 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	DRM_INFO("fb mappable at 0x%lx\n",  info->fix.smem_start);
 	DRM_INFO("vram aper   at 0x%lx\n", (unsigned long)priv->vmem_addr);
 	DRM_INFO("size %u (0x%x)\n", size, size);
-	DRM_INFO("fb depth is %d\n", fb->depth);
-	DRM_INFO("   pitch is %d\n", fb->pitch);
+	DRM_INFO("fb depth is %d\n", fb->format->depth);
+	DRM_INFO("   pitch is %d\n", fb->pitches[0]);
 	DRM_INFO("  height is %d\n", fb->height);
 	DRM_INFO("   width is %d\n", fb->width);
 
@@ -547,8 +582,9 @@ err_bo_destroy:
 }
 
 static struct drm_fb_helper_funcs lx_fb_helper_funcs = {
+#if 0
 	.gamma_get = lx_crtc_fb_gamma_get,
-	.gamma_set = lx_crtc_fb_gamma_set,
+#endif
 	.fb_probe  = lx_fb_helper_probe,
 };
 
@@ -566,17 +602,16 @@ static int lx_fbdev_init(struct drm_device *dev)
 		return -ENOMEM;
 
 	lfb->priv = priv;
-	lfb->helper.funcs = &lx_fb_helper_funcs;
 
 	priv->fb = lfb;
 
-	ret = drm_fb_helper_init(dev, &lfb->helper, 1, LX_NUM_CONNECTORS);
+	drm_fb_helper_prepare(dev, &lfb->helper, &lx_fb_helper_funcs);
+	ret = drm_fb_helper_init(dev, &lfb->helper);
 	if (ret) {
 		DRM_DEBUG_DRIVER("error init'ing fb_helper: %d\n", ret);
 		return ret;
 	}
 
-	drm_fb_helper_single_add_all_connectors(&lfb->helper);
 	drm_fb_helper_initial_config(&lfb->helper, bpp);
 
 	return 0;
@@ -608,15 +643,15 @@ static void lx_fbdev_fini(struct drm_device *dev)
 static struct drm_framebuffer *
 lx_user_fb_create(struct drm_device *dev,
 		  struct drm_file *file_priv,
-		  struct drm_mode_fb_cmd *mode_cmd)
+		  const struct drm_mode_fb_cmd2 *mode_cmd)
 {
-	struct lx_bo *bo = idr_find(&file_priv->object_idr, mode_cmd->handle);
+	struct lx_bo *bo = idr_find(&file_priv->object_idr, mode_cmd->handles[0]);
 	struct lx_fb *lfb;
 	int ret;
 
 	if (!bo) {
 		DRM_ERROR("object with handle %d doesn't exist\n",
-			  mode_cmd->handle);
+			  mode_cmd->handles[0]);
 		return ERR_PTR(-ENOENT);
 	}
 
@@ -656,23 +691,7 @@ static struct drm_encoder * lx_connector_best_encoder(
 static struct drm_encoder * lx_connector_attached_encoder(
 		struct drm_connector *connector)
 {
-	int i;
-
-	for (i=0; i<DRM_CONNECTOR_MAX_ENCODER; i++) {
-		struct drm_mode_object *obj;
-
-		if (connector->encoder_ids[i] == 0)
-			break;
-
-		obj = drm_mode_object_find(connector->dev,
-					   connector->encoder_ids[i],
-					   DRM_MODE_OBJECT_ENCODER);
-
-		if (obj)
-			return obj_to_encoder(obj);
-	}
-
-	return NULL;
+	return connector->encoder;
 }
 
 static bool lx_connector_get_edid(struct drm_connector *connector,
@@ -693,19 +712,18 @@ static bool lx_connector_get_edid(struct drm_connector *connector,
 	if (!edid) {
 		if (verbose)
 			DRV_INFO("failed to retrieve EDID for %s\n",
-				 drm_get_connector_name(connector));
+				 connector->name);
 	} else if (!drm_edid_is_valid(edid)) {
 		if (verbose)
 			DRV_INFO("EDID retrieved for %s is invalid\n",
-				 drm_get_connector_name(connector));
-		connector->display_info.raw_edid = NULL;
+				 connector->name);
 		kfree(edid);
 		edid = NULL;
 	}
 
 out:
 	/* In any case update the edid property to reflect the current status */
-	drm_mode_connector_update_edid_property(connector, edid);
+	drm_connector_update_edid_property(connector, edid);
 	lx_conn->edid = edid;
 
 	return edid != NULL;
@@ -717,14 +735,18 @@ static enum drm_connector_status lx_connector_detect(
 	struct lx_priv *priv = connector->dev->dev_private;
 	struct lx_connector *lx_conn = to_lx_connector(connector);
 	struct drm_encoder *encoder;
-	struct drm_encoder_helper_funcs *encoder_funcs;
-	struct drm_connector_helper_funcs *connector_funcs;
+	const struct drm_encoder_helper_funcs *encoder_funcs;
+	const struct drm_connector_helper_funcs *connector_funcs;
 	enum drm_connector_status status = connector_status_unknown;
 
 	switch (lx_conn->id) {
 	case LX_CONNECTOR_VGA:
 		if (lx_connector_get_edid(connector, priv->ddc, false))
 			status = connector_status_connected;
+		break;
+	case LX_CONNECTOR_LVDS:
+	case LX_CONNECTOR_VOP:
+		/* TODO: detect connector status */
 		break;
 	}
 
@@ -745,7 +767,7 @@ static int lx_connector_mode_valid(struct drm_connector *connector,
 {
 	struct lx_connector *lx_conn = to_lx_connector(connector);
 
-	if (mode->vrefresh > LX_MODE_MAX_VFREQ)
+	if (drm_mode_vrefresh(mode) > LX_MODE_MAX_VFREQ)
 		return MODE_CLOCK_HIGH;
 
 	if (lx_conn->max_hz && mode->clock - LX_MODE_FREQ_TOL > lx_conn->max_hz)
@@ -768,7 +790,7 @@ static void lx_connector_destroy(struct drm_connector *connector)
 
 	/* TODO: switch off outputs? */
 
-	drm_sysfs_connector_remove(connector);
+	drm_connector_unregister(connector);
 	drm_connector_cleanup(connector);
 
 	if (lx_conn->edid)
@@ -797,7 +819,7 @@ static int lx_connector_vga_get_modes(struct drm_connector *connector)
 	}
 	DRV_INFO("added %d %s modes for connector %s\n", num_modes,
 		 have_edid ? "EDID" : "static",
-		 drm_get_connector_name(connector));
+		 connector->name);
 
 	return num_modes;
 }
@@ -917,10 +939,13 @@ static struct drm_connector * lx_connector_init(struct drm_device *dev,
 	}
 
 	/* TODO: really setup outputs? */
+#if 0 /* TODO: This API did go away since v3.0. Where to? */
 	connector->initial_x = 0;
 	connector->initial_y = 0;
+#endif
 
-	drm_sysfs_connector_add(connector);
+	/* TODO: handle return value */
+	drm_connector_register(connector);
 
 	return connector;
 }
@@ -1022,7 +1047,7 @@ static void lx_encoder_dac_dpms(struct drm_encoder *encoder, int mode) {
 
 static void lx_encoder_prepare(struct drm_encoder *encoder)
 {
-	struct drm_encoder_helper_funcs *encoder_funcs;
+	const struct drm_encoder_helper_funcs *encoder_funcs;
 
 	encoder_funcs = encoder->helper_private;
 	encoder_funcs->dpms(encoder, DRM_MODE_DPMS_OFF);
@@ -1030,7 +1055,7 @@ static void lx_encoder_prepare(struct drm_encoder *encoder)
 
 static void lx_encoder_commit(struct drm_encoder *encoder)
 {
-	struct drm_encoder_helper_funcs *encoder_funcs;
+	const struct drm_encoder_helper_funcs *encoder_funcs;
 
 	encoder_funcs = encoder->helper_private;
 	encoder_funcs->dpms(encoder, DRM_MODE_DPMS_ON);
@@ -1130,7 +1155,9 @@ static const struct drm_encoder_helper_funcs lx_encoder_dac_helper_funcs = {
 	.dpms = lx_encoder_dac_dpms,
 	.prepare = lx_encoder_prepare,
 	.commit = lx_encoder_commit,
+#if 0 /* TODO: This API went away since v3.0. Where to? */
 	.mode_fixup = lx_encoder_dac_mode_fixup,
+#endif
 	.mode_set = lx_encoder_dac_mode_set,
 #if 0
 	void (*save)(struct drm_encoder *encoder);
@@ -1167,7 +1194,9 @@ static struct drm_encoder * lx_encoder_init(struct drm_device *dev,
 	lx_enc->id = encoder_id;
 
 	drm_encoder_init(dev, encoder, &lx_encoder_funcs,
-			 lx_encoder_types[encoder_id].type);
+			 lx_encoder_types[encoder_id].type,
+			 "lx:enc:%s",
+			 encoder_id == LX_ENCODER_DAC ? "dac" : "panel");
 
 	drm_encoder_helper_add(encoder, lx_encoder_types[encoder_id].hfuncs);
 
@@ -1211,11 +1240,12 @@ static void lx_crtc_fb_gamma_get(struct drm_crtc *crtc, u16 *red, u16 *green,
 	*blue   = lut_entry->b << 8;
 }
 
-static void lx_crtc_gamma_set(struct drm_crtc *crtc, u16 *r, u16 *g, u16 *b,
-			      uint32_t start, uint32_t size)
+static int lx_crtc_gamma_set(struct drm_crtc *crtc, u16 *r, u16 *g, u16 *b,
+			     uint32_t size, struct drm_modeset_acquire_ctx *ctx)
 {
 	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
 	struct lx_rgb *lut_entry;
+	uint32_t start = 0;
 	uint32_t i, end;
 
 	end = (start + size > LX_LUT_SIZE) ? LX_LUT_SIZE : (start + size);
@@ -1228,6 +1258,8 @@ static void lx_crtc_gamma_set(struct drm_crtc *crtc, u16 *r, u16 *g, u16 *b,
 	}
 
 	lx_crtc_load_lut(crtc);
+
+	return 0;
 }
 
 static int lx_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
@@ -1422,26 +1454,27 @@ static void lx_crtc_reset(struct drm_crtc *crtc)
 
 /* called by drm framework for the page-flip ioctl */
 static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
-			     struct drm_pending_vblank_event *event)
+			     struct drm_pending_vblank_event *event,
+			     uint32_t _flags, struct drm_modeset_acquire_ctx *ctx)
 {
 	struct lx_priv *priv = crtc->dev->dev_private;
 	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
 	struct lx_fb *lfb = to_lx_fb(fb);
-	struct lx_fb *lfb2 = to_lx_fb(crtc->fb);
+	struct lx_fb *lfb2 = to_lx_fb(crtc->primary->fb);
 	unsigned long flags;
 	unsigned offset;
 	int ret;
 
 	DRM_DEBUG_DRIVER("pipe: %d, old fb: %p, bo @ %lx, size: %lu; new fb: %p, bo @ %lx, size: %lu\n",
-			 event->pipe, crtc->fb,
-			 crtc->fb && lfb2->bo ? (unsigned long)(lfb2->bo->node->start + priv->vmem_addr) : 0UL,
-			 crtc->fb && lfb2->bo ? (unsigned long)(lfb2->bo->node->size) : 0UL,
+			 event->pipe, crtc->primary->fb,
+			 crtc->primary->fb && lfb2->bo ? (unsigned long)(lfb2->bo->node->start + priv->vmem_addr) : 0UL,
+			 crtc->primary->fb && lfb2->bo ? (unsigned long)(lfb2->bo->node->size) : 0UL,
 			 fb,
 			 lfb->bo ? (unsigned long)(lfb->bo->node->start + priv->vmem_addr) : 0UL,
 			 lfb->bo ? (unsigned long)(lfb->bo->node->size) : 0UL);
 
 	offset = (lfb->bo) ? lfb->bo->node->start : 0;
-	offset += crtc->y * fb->pitch + crtc->x * ALIGN(fb->bits_per_pixel, 8) / 8;
+	offset += crtc->y * fb->pitches[0] + crtc->x * ALIGN(drm_format_info_bpp(fb->format, 0), 8) / 8;
 
 	/* Abuse the event_lock for protecting the event */
 	spin_lock_irqsave(&priv->ddev->event_lock, flags);
@@ -1462,9 +1495,10 @@ static int lx_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	dc_lock(priv);
 	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 
-	crtc->fb = fb;
+	/* TODO: call drm_mode_set_config_internal() instead? */
+	crtc->primary->fb = fb;
 
-	ret = drm_vblank_get(priv->ddev, lx_crtc->id);
+	ret = drm_crtc_vblank_get(crtc);
 	if (ret) {
 		DRM_ERROR("failed to get vblank event before page flip: %d\n", ret);
 		lx_crtc->event = NULL;
@@ -1492,23 +1526,129 @@ static void lx_crtc_do_page_flip(struct drm_crtc *crtc)
 	lx_crtc->event = NULL;
 	lx_crtc->flip_scheduled = false;
 	if (e) {
+		struct timespec64 ts = ktime_to_timespec64(priv->last_vblank);
 		/* wakeup userspace */
-		e->event.sequence = drm_vblank_count(priv->ddev, lx_crtc->id);
-		e->event.tv_sec = priv->last_vblank.tv_sec;
-		e->event.tv_usec = priv->last_vblank.tv_usec;
+		e->event.vbl.sequence = drm_crtc_vblank_count(crtc);
+		e->event.vbl.tv_sec = ts.tv_sec;
+		e->event.vbl.tv_usec = ts.tv_nsec / 1000;
 		list_add_tail(&e->base.link, &e->base.file_priv->event_list);
 		wake_up_interruptible(&e->base.file_priv->event_wait);
 	}
 
 	spin_unlock_irqrestore(&priv->ddev->event_lock, flags);
 
-	drm_vblank_put(priv->ddev, lx_crtc->id);
+	drm_crtc_vblank_put(crtc);
+}
+
+
+/**
+ * Gets the current scanline value from the scanout logic.
+ *
+ * @return negative when the value is currently transitioning due to being
+ *         unbuffered, a valid vpos otherwise
+ */
+static int lx_get_scanout_vpos(struct lx_priv *priv)
+{
+	u32 v = read_dc(priv, DC_LINE_CNT);
+	u32 w = read_dc(priv, DC_LINE_CNT);
+	return (v == w) ? v & DC_LINE_CNT_DOT_LINE_CNT_MASK : -EAGAIN;
+}
+
+/**
+ * @get_vblank_timestamp:
+ *
+ * Called by drm_get_last_vbltimestamp(). Should return a precise
+ * timestamp when the most recent vblank interval ended or will end.
+ *
+ * Specifically, the timestamp in @vblank_time should correspond as
+ * closely as possible to the time when the first video scanline of
+ * the video frame after the end of vblank will start scanning out,
+ * the time immediately after end of the vblank interval. If the
+ * @crtc is currently inside vblank, this will be a time in the future.
+ * If the @crtc is currently scanning out a frame, this will be the
+ * past start time of the current scanout. This is meant to adhere
+ * to the OpenML OML_sync_control extension specification.
+ *
+ * Parameters:
+ *
+ * crtc:
+ *     CRTC for which timestamp should be returned.
+ * max_error:
+ *     Maximum allowable timestamp error in nanoseconds.
+ *     Implementation should strive to provide timestamp
+ *     with an error of at most max_error nanoseconds.
+ *     Returns true upper bound on error for timestamp.
+ * vblank_time:
+ *     Target location for returned vblank timestamp.
+ * in_vblank_irq:
+ *     True when called from drm_crtc_handle_vblank().  Some drivers
+ *     need to apply some workarounds for gpu-specific vblank irq quirks
+ *     if flag is set.
+ *
+ * Returns:
+ *
+ * True on success, false on failure, which means the core should
+ * fallback to a simple timestamp taken in drm_crtc_handle_vblank().
+ */
+static bool lx_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
+					 int *max_error, ktime_t *vblank_time,
+					 bool in_vblank_irq)
+{
+	struct drm_device *dev = crtc->dev;
+	struct lx_crtc *lcrtc = to_lx_crtc(crtc);
+	struct lx_priv *priv = dev->dev_private;
+
+	if (lcrtc->id != LX_CRTC_GRAPHIC)
+		return false;
+
+	if (in_vblank_irq) {
+		/* the correct timestamp has been saved by our irq-handler */
+		*vblank_time = priv->last_vblank;
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * enable_vblank - enable vblank interrupt events
+ * @dev: DRM device
+ * @crtc: which irq to enable
+ *
+ * Enable vblank interrupts for @crtc.  If the device doesn't have
+ * a hardware vblank counter, this routine should be a no-op, since
+ * interrupts will have to stay on to keep the count accurate.
+ *
+ * This is deprecated and should not be used by new drivers.
+ * Use drm_crtc_funcs.enable_vblank instead.
+ *
+ * @return  zero on success, appropriate errno if the given @crtc's vblank
+ *          interrupt cannot be enabled.
+ */
+static int lx_driver_enable_vblank(struct drm_device *dev, unsigned int pipe)
+{
+	return 0;
+}
+
+/**
+ * disable_vblank - disable vblank interrupt events
+ * @dev: DRM device
+ * @crtc: which irq to enable
+ *
+ * This is deprecated and should not be used by new drivers.
+ * Use drm_crtc_funcs.disable_vblank instead.
+ *
+ * Disable vblank interrupts for @crtc.  If the device doesn't have
+ * a hardware vblank counter, this routine should be a no-op, since
+ * interrupts will have to stay on to keep the count accurate.
+ */
+static void lx_driver_disable_vblank(struct drm_device *dev, unsigned int pipe)
+{
 }
 
 static const struct drm_crtc_funcs lx_crtc_funcs = {
-	.gamma_set = lx_crtc_gamma_set,
-	.set_config = drm_crtc_helper_set_config,
-	.destroy = drm_crtc_cleanup,
+	.set_config		= drm_crtc_helper_set_config,
+	.destroy		= drm_crtc_cleanup,
 	/*
 	 * Flip to the given framebuffer.  This implements the page
 	 * flip ioctl described in drm_mode.h, specifically, the
@@ -1518,8 +1658,13 @@ static const struct drm_crtc_funcs lx_crtc_funcs = {
 	 * argument will point to an event to send back when the flip
 	 * completes, otherwise it will be NULL.
 	 */
-	.page_flip = lx_crtc_page_flip,
-	/* TODO: these need testing: */
+	.page_flip		= lx_crtc_page_flip,
+	.get_vblank_timestamp	= lx_crtc_get_vblank_timestamp,
+#if 0 /* This API went away since v3.0. Where to? */
+	.gamma_set = lx_crtc_fb_gamma_set,
+#else
+	.gamma_set = lx_crtc_gamma_set,
+#endif	/* TODO: these need testing: */
 	.cursor_set = lx_crtc_cursor_set,
 	.cursor_move = lx_crtc_cursor_move,
 #if 0
@@ -1560,18 +1705,18 @@ static void lx_crtc_dpms(struct drm_crtc *crtc, int mode) {
 }
 
 static bool lx_crtc_mode_fixup(struct drm_crtc *crtc,
-			       struct drm_display_mode *mode,
+			       const struct drm_display_mode *mode,
 			       struct drm_display_mode *adjusted_mode)
 {
 	int ret;
+	u32 pllval;
 
 	drm_mode_set_crtcinfo(adjusted_mode, 0);
 
-	ret = lx_graphic_mode_valid(adjusted_mode,
-				    &adjusted_mode->clock,
-				    &adjusted_mode->private_flags);
+	ret = lx_graphic_mode_valid(adjusted_mode, &adjusted_mode->clock,
+				    &pllval);
 	DRM_DEBUG_DRIVER("ret: %d, clock: %d, pllval: %04x", ret,
-			 adjusted_mode->clock, adjusted_mode->private_flags);
+			 adjusted_mode->clock, pllval);
 
 	return (ret == MODE_OK);
 }
@@ -1627,12 +1772,13 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 				 struct drm_framebuffer *old_fb)
 {
 	struct lx_priv *priv = crtc->dev->dev_private;
-	struct drm_framebuffer *fb = crtc->fb;
+	struct drm_framebuffer *fb = crtc->primary->fb;
 	struct lx_fb *lfb;
 	struct lx_crtc *lx_crtc = to_lx_crtc(crtc);
 	int offset, atomic = 0;
 	u32 gcfg, dcfg, dvctl;
 	u32 gfx_pitch, fb_width, fb_height, line_sz;
+	unsigned bpp;
 
 	DRM_DEBUG_DRIVER("x: %d, y: %d, new fb: %p, old fb: %p\n",
 			 x, y, fb, old_fb);
@@ -1664,7 +1810,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 
 	gcfg &= ~DC_GENERAL_CFG_FDTY;
 	gcfg &= ~DC_GENERAL_CFG_STFM;
-	switch (fb->pitch) {
+	switch (fb->pitches[0]) {
 	case 1024:
 	case 2048:
 	case 4096:
@@ -1702,13 +1848,14 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 		dcfg |= VID_OVL_PRIO_HIGH_START << DC_DISPLAY_CFG_VFHPSL_SHIFT;
 	}
 
-	switch (fb->bits_per_pixel) {
+	bpp = drm_format_info_bpp(fb->format, 0);
+	switch (bpp) {
 	case 8:
 		dcfg |= DC_DISPLAY_CFG_DISP_MODE_8BPP;
 		break;
 	case 16:
 		dcfg |= DC_DISPLAY_CFG_DISP_MODE_16BPP;
-		if (fb->depth == 15) {
+		if (fb->format->depth == 15) {
 			dcfg |= DC_DISPLAY_CFG_16BPP_0555;
 		} else {
 			dcfg |= DC_DISPLAY_CFG_16BPP_0565;
@@ -1738,7 +1885,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	/* bits [2:0] are added to the pixel panning offset after next vsync */
 	/* If this value is != 0, framebuffer compression is unavailable */
 	offset = lfb->bo->node->start;
-	offset += y * fb->pitch + x * ALIGN(fb->bits_per_pixel, 8) / 8;
+	offset += y * fb->pitches[0] + x * ALIGN(bpp, 8) / 8;
 	write_dc(priv, DC_FB_ST_OFFSET, offset);
 
 	/* TODO: write compressed buffer offset */
@@ -1748,7 +1895,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	write_dc(priv, DC_DV_TOP, 0); /* TODO: DV-RAM disabled */
 
 	/* #qwords to transfer per scanline */
-	line_sz = ALIGN(fb->width * ALIGN(fb->bits_per_pixel, 8) / 8, 8) / 8;
+	line_sz = ALIGN(fb->width * ALIGN(bpp, 8) / 8, 8) / 8;
 	BUG_ON(line_sz >= 1024);
 	write_dc(priv, DC_LINE_SIZE, /* in qwords */
 		 0 << 20 /* TODO: video, align 4 */ |
@@ -1756,7 +1903,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 		 line_sz << 0); /* frame buffer */
 
 	/* pitch in qwords */
-	gfx_pitch = fb->pitch / 8;
+	gfx_pitch = fb->pitches[0] / 8;
 	write_dc(priv, DC_GFX_PITCH, 0 << 16 /* TODO */ | gfx_pitch << 0);
 
 	/* TODO: DC_VID_YUV_PITCH */
@@ -1770,7 +1917,7 @@ static int lx_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 			 "px 0 to %u, fb_height: line 0 to %u, fb->width: %u, "
 			 "fb->height: %u, fb->pitch: %u, fb->bpp: %u\n",
 			 line_sz, gfx_pitch, fb_width, fb_height, fb->width,
-			 fb->height, fb->pitch, fb->bits_per_pixel);
+			 fb->height, fb->pitches[0], bpp);
 
 	/* TODO: video downscaling */
 
@@ -1841,14 +1988,19 @@ static int lx_crtc_mode_set(struct drm_crtc *crtc,
 			    int x, int y, struct drm_framebuffer *old_fb)
 {
 	struct lx_priv *priv = crtc->dev->dev_private;
-	u32 lo, hi, dcfg, vcfg, real_freq;
+	u32 lo, hi, dcfg, vcfg, real_freq, freq_khz;
+	s32 pllval;
 	unsigned encoders = lx_crtc_get_enabled_encoders(crtc);
 
 	DRM_DEBUG_DRIVER("\n");
 	drm_mode_debug_printmodeline(m);
 
 	/* dot-PLL */
-	real_freq = lx_set_dotpll(m->private_flags & LX_MODE_PFLAG_DOTPLL_MASK);
+	freq_khz = m->clock;
+	pllval = lx_find_matching_pll(&freq_khz, LX_MODE_FREQ_TOL);
+	if (pllval < 0)
+		return MODE_CLOCK_RANGE;
+	real_freq = lx_set_dotpll(pllval & LX_MODE_PFLAG_DOTPLL_MASK);
 	if (!real_freq)
 		return MODE_CLOCK_RANGE;
 
@@ -2011,13 +2163,15 @@ static void lx_crtc_load_lut(struct drm_crtc *crtc)
 }
 
 static const struct drm_crtc_helper_funcs lx_crtc_helper_funcs = {
-	.dpms		= lx_crtc_dpms, /* if (ON) update_scanout; commit */
-	.mode_fixup	= lx_crtc_mode_fixup, /* return 1 */
-	.mode_set	= lx_crtc_mode_set, /* update (omap_)crtc->info w/ adjusted_mode && update_scanout */
-	.prepare	= lx_crtc_prepare,
-	.commit		= lx_crtc_commit,
-	.mode_set_base	= lx_crtc_mode_set_base,
+	.dpms			= lx_crtc_dpms, /* if (ON) update_scanout; commit */
+	.mode_fixup		= lx_crtc_mode_fixup, /* return 1 */
+	.mode_set		= lx_crtc_mode_set, /* update (omap_)crtc->info w/ adjusted_mode && update_scanout */
+	.prepare		= lx_crtc_prepare,
+	.commit			= lx_crtc_commit,
+	.mode_set_base		= lx_crtc_mode_set_base,
+#if 0 /* This API went away since v3.0. Where to? */
 	.load_lut	= lx_crtc_load_lut,
+#endif
 #if 0
 	.disable, /* more explicit than dpms */
 	int (*mode_set_base_atomic)(struct drm_crtc *crtc,
@@ -2085,11 +2239,10 @@ static int lx_connector_encoder_init(struct drm_device *dev,
 	if (encoder_id != LX_ENCODER_DAC)
 		encoder->possible_clones = 1 << LX_ENCODER_DAC;
 
-	ret = drm_mode_connector_attach_encoder(connector, encoder);
+	ret = drm_connector_attach_encoder(connector, encoder);
 	if (ret) {
 		DRM_ERROR("failed to attach encoder %s to %s\n",
-			  drm_get_encoder_name(encoder),
-			  drm_get_connector_name(connector));
+			  encoder->name, connector->name);
 		goto out;
 	}
 
@@ -2365,8 +2518,8 @@ static int lx_map_video_memory(struct drm_device *dev)
 		/* the unused BAR 4 points to MSRs for the video input port */
 	};
 	char tmp[24];
-	struct pci_dev *pdev = dev->pdev;
 	struct lx_priv *priv = dev->dev_private;
+	struct pci_dev *pdev = priv->pdev;
 	unsigned i;
 	int ret;
 
@@ -2399,25 +2552,21 @@ static int lx_map_video_memory(struct drm_device *dev)
 	/* stolen memory, add priv->vmem_phys to all blocks from this mm to get
 	 * the linear address
 	 * (mapped by the GLIU0 to the end of the physical RAM) */
-	ret = drm_mm_init(&priv->mman.mm, 0, priv->vmem_size);
-	if (ret) {
-		DRM_ERROR("error initializing memory manager: %d\n", ret);
-		goto failed_mm;
-	}
+	drm_mm_init(&priv->mman.mm, 0, priv->vmem_size);
 
-	ret = drm_addmap(dev,
+	ret = drm_legacy_addmap(dev,
 		   pci_resource_start(pdev, 1), pci_resource_len(pdev, 1),
 		   _DRM_REGISTERS, _DRM_READ_ONLY | _DRM_DRIVER, &priv->gp);
 	if (ret)
 		goto failed_map_gp;
 
-	ret = drm_addmap(dev,
+	ret = drm_legacy_addmap(dev,
 		   pci_resource_start(pdev, 2), pci_resource_len(pdev, 2),
 		   _DRM_REGISTERS, _DRM_READ_ONLY | _DRM_DRIVER, &priv->dc);
 	if (ret)
 		goto failed_map_dc;
 
-	ret = drm_addmap(dev,
+	ret = drm_legacy_addmap(dev,
 		   pci_resource_start(pdev, 3), pci_resource_len(pdev, 3),
 		   _DRM_REGISTERS, _DRM_READ_ONLY | _DRM_DRIVER, &priv->vp);
 	if (ret)
@@ -2443,9 +2592,9 @@ static int lx_map_video_memory(struct drm_device *dev)
 	return 0;
 
 failed_map_vp:
-	drm_rmmap(dev, priv->dc);
+	drm_legacy_rmmap(dev, priv->dc);
 failed_map_dc:
-	drm_rmmap(dev, priv->gp);
+	drm_legacy_rmmap(dev, priv->gp);
 failed_map_gp:
 	drm_mm_takedown(&priv->mman.mm);
 failed_mm:
@@ -2458,12 +2607,12 @@ failed_req:
 
 static void lx_unmap_video_memory(struct drm_device *dev)
 {
-	struct pci_dev *pdev = dev->pdev;
 	struct lx_priv *priv = dev->dev_private;
+	struct pci_dev *pdev = priv->pdev;
 
-	drm_rmmap(dev, priv->vp);
-	drm_rmmap(dev, priv->dc);
-	drm_rmmap(dev, priv->gp);
+	drm_legacy_rmmap(dev, priv->vp);
+	drm_legacy_rmmap(dev, priv->dc);
+	drm_legacy_rmmap(dev, priv->gp);
 
 	drm_mm_takedown(&priv->mman.mm);
 
@@ -2473,10 +2622,16 @@ static void lx_unmap_video_memory(struct drm_device *dev)
 	pci_release_region(pdev, 0);
 }
 
+#if 0 /* v3.0 API; seems to have been replaced by DRIVER_USE_AGP */
 static int lx_driver_device_is_agp(struct drm_device *dev)
 {
 	return 0;
 }
+#endif
+
+#ifndef CONFIG_DRM_LEGACY
+# error require CONFIG_DRM_LEGACY=y
+#endif
 
 /** @flags: set in pci id list, not needed here */
 int lx_driver_load(struct drm_device *dev, unsigned long flags)
@@ -2492,7 +2647,7 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags)
 		return -ENOMEM;
 
 	priv->ddev = dev;
-	priv->pdev = dev->pdev;
+	priv->pdev = to_pci_dev(dev->dev);
 
 	dev->dev_private = priv;
 
@@ -2505,7 +2660,7 @@ int lx_driver_load(struct drm_device *dev, unsigned long flags)
 	lx_modeset_init(dev);
 
 	drm_vblank_init(dev, 1 /* TODO: LX_NUM_CRTCS */);
-	drm_irq_install(dev);
+	// v3.0 API: drm_irq_install(dev);
 
 	rdmsr(0xa0002001, lo, hi);
 	DRM_DEBUG_DRIVER("GP GLD config: %08x\n", lo);
@@ -2553,96 +2708,26 @@ failed_map_video_memory:
 	return ret;
 }
 
-static int lx_driver_unload(struct drm_device *dev)
+static void lx_driver_unload(struct drm_device *dev)
 {
 	struct lx_priv *priv = dev->dev_private;
-	int ret = 0;
+	int ret;
 
-	if (dev->irq_enabled) {
-		ret = drm_irq_uninstall(dev);
+	if (drm_core_check_feature(dev, DRIVER_HAVE_IRQ) && dev->irq_enabled) {
+		ret = drm_legacy_irq_uninstall(dev);
 		if (ret)
 			DRV_INFO("failed uninstalling IRQs: %d\n", ret);
 	}
 
-	drm_vblank_cleanup(dev);
+	// v3.0 API: drm_vblank_cleanup(dev);
 
 	lx_modeset_cleanup(dev);
 	lx_unmap_video_memory(dev);
 
 	kfree(priv);
-
-	return ret;
 }
 
-/**
- * Gets the current scanline value from the scanout logic.
- *
- * @return negative when the value is currently transitioning due to being
- *         unbuffered, a valid vpos otherwise
- */
-static int lx_get_scanout_vpos(struct lx_priv *priv)
-{
-	u32 v = read_dc(priv, DC_LINE_CNT);
-	u32 w = read_dc(priv, DC_LINE_CNT);
-	return (v == w) ? v & DC_LINE_CNT_DOT_LINE_CNT_MASK : -EAGAIN;
-}
-
-/**
- * \returns
- * Zero if timestamping isn't supported in current display mode or a
- * negative number on failure. A positive status code on success,
- * which describes how the vblank_time timestamp was computed.
- */
-static int lx_driver_get_vblank_timestamp(struct drm_device *dev, int crtc,
-					  int *max_error,
-					  struct timeval *vblank_time,
-					  unsigned flags)
-{
-	struct lx_priv *priv = dev->dev_private;
-
-	if (crtc != LX_CRTC_GRAPHIC)
-		return -EINVAL;
-
-	if (flags & DRM_CALLED_FROM_VBLIRQ) {
-		/* the correct timestamp has been saved by our irq-handler */
-		*vblank_time = priv->last_vblank;
-		return 1;
-	}
-
-	return 0;
-}
-
-/**
- * enable_vblank - enable vblank interrupt events
- * @dev: DRM device
- * @crtc: which irq to enable
- *
- * Enable vblank interrupts for @crtc.  If the device doesn't have
- * a hardware vblank counter, this routine should be a no-op, since
- * interrupts will have to stay on to keep the count accurate.
- *
- * @return  zero on success, appropriate errno if the given @crtc's vblank
- *          interrupt cannot be enabled.
- */
-static int lx_driver_enable_vblank(struct drm_device *dev, int crtc)
-{
-	return 0;
-}
-
-/**
- * disable_vblank - disable vblank interrupt events
- * @dev: DRM device
- * @crtc: which irq to enable
- *
- * Disable vblank interrupts for @crtc.  If the device doesn't have
- * a hardware vblank counter, this routine should be a no-op, since
- * interrupts will have to stay on to keep the count accurate.
- */
-static void lx_driver_disable_vblank(struct drm_device *dev, int crtc)
-{
-}
-
-static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
+static irqreturn_t lx_driver_irq_handler(int irq, void *arg)
 {
 	struct drm_device *dev = arg;
 	struct lx_priv *priv = dev->dev_private;
@@ -2678,7 +2763,7 @@ static irqreturn_t lx_driver_irq_handler(DRM_IRQ_ARGS)
 
 		/* need to get the timestamp first as the do_page_flip code may
 		 * already depend on it to send back to userspace */
-		do_gettimeofday(&priv->last_vblank);
+		priv->last_vblank = ktime_get();
 
 		/* process possibly pending page flip */
 		lx_crtc_do_page_flip(&priv->crtcs[LX_CRTC_GRAPHIC].base);
@@ -2801,8 +2886,10 @@ static int lx_driver_open(struct drm_device *dev, struct drm_file *file)
  */
 static void lx_driver_lastclose(struct drm_device *dev)
 {
+	struct lx_priv *priv = dev->dev_private;
+
 	DRM_DEBUG_DRIVER("\n");
-	drm_fb_helper_restore();
+	drm_fb_helper_restore_fbdev_mode_unlocked(&priv->fb->helper);
 	vga_switcheroo_process_delayed_switch();
 }
 
@@ -2811,14 +2898,15 @@ static void lx_driver_preclose(struct drm_device *dev, struct drm_file *file)
 	DRM_DEBUG_DRIVER("\n");
 }
 
-static int lx_idr_free(int id, void *p, void *data)
+static int lx_idr_free(int id, void * p, void * data)
 {
-	struct drm_file *file_priv = data;
-	struct lx_priv *priv = file_priv->driver_priv;
-	struct lx_bo *bo = p;
+	struct drm_file * file_priv = data;
+	struct lx_priv * priv = file_priv->driver_priv;
+	struct lx_bo * bo = p;
 
-	DRV_INFO("removing left-over chunk with handle %d, size: %lu at %lx\n",
-		 id, bo->node->size, bo->node->start);
+	DRV_INFO(
+	        "removing left-over chunk with handle %d, size: %llu at %llx\n",
+	        id, bo->node->size, bo->node->start);
 	lx_bo_destroy(priv, file_priv, bo);
 
 	return 0;
@@ -2829,7 +2917,6 @@ static void lx_driver_postclose(struct drm_device *dev, struct drm_file *file)
 	DRM_DEBUG_DRIVER("\n");
 
 	idr_for_each(&file->object_idr, lx_idr_free, file);
-	idr_remove_all(&file->object_idr);
 	idr_destroy(&file->object_idr);
 
 	file->driver_priv = NULL;
@@ -2863,7 +2950,7 @@ static int lx_driver_dumb_create(struct drm_file *file_priv,
 
 	bo = lx_bo_create(file_priv, node);
 	if (!bo) {
-		drm_mm_put_block(node);
+		drm_mm_remove_node(node);
 		return -ENOMEM;
 	}
 
@@ -2892,7 +2979,7 @@ static int lx_driver_dumb_map_offset(struct drm_file *file_priv,
 
 	ret = lx_bo_addmap(priv, bo);
 	if (ret) {
-		DRM_ERROR("unable to add local map for object %d, size: %lu\n",
+		DRM_ERROR("unable to add local map for object %d, size: %llu\n",
 			  handle, bo->node->size);
 		return ret;
 	}
@@ -2920,21 +3007,33 @@ static int lx_driver_dumb_destroy(struct drm_file *file_priv,
 	return 0;
 }
 
-static struct drm_driver lx_driver = {
-	.driver_features	= DRIVER_HAVE_IRQ | DRIVER_IRQ_SHARED |
+static const struct file_operations lx_driver_fops = {
+	.owner		= THIS_MODULE,
+	.open		= drm_open,
+	.release	= drm_release,
+	.unlocked_ioctl	= drm_ioctl,
+	.mmap		= drm_legacy_mmap,
+/*	.fasync		= drm_fasync, // drm_fasync got removed since v3.0 */
+	.poll		= drm_poll,
+	.read		= drm_read,
+	.llseek		= noop_llseek,
+};
+
+static const struct drm_driver lx_driver = {
+	.driver_features	= DRIVER_HAVE_IRQ |
+/*				  DRIVER_IRQ_SHARED | // v3.0 API */
 				  DRIVER_MODESET,
 	.dev_priv_size		= sizeof(struct lx_priv),
 	.load			= lx_driver_load,
 	.unload			= lx_driver_unload,
-	.device_is_agp		= lx_driver_device_is_agp,
+/*	.device_is_agp		= lx_driver_device_is_agp, // v3.0 API */
 	.irq_preinstall		= lx_driver_irq_preinstall,
 	.irq_postinstall	= lx_driver_irq_postinstall,
 	.irq_uninstall		= lx_driver_irq_uninstall,
 	.irq_handler		= lx_driver_irq_handler,
 	.enable_vblank		= lx_driver_enable_vblank,
 	.disable_vblank		= lx_driver_disable_vblank,
-	.get_vblank_counter	= drm_vblank_count,
-	.get_vblank_timestamp	= lx_driver_get_vblank_timestamp,
+/*	.get_vblank_counter	= drm_vblank_count, // legacy API, drm_vblank_count() went away since v3.0 */
 
 	/* These need rework ... */
 	.open			= lx_driver_open,
@@ -2954,17 +3053,8 @@ static struct drm_driver lx_driver = {
 	// .dma_quiescent		= lx_driver_dma_quiescent,
 	// .dma_ioctl		= lx_driver_dma_ioctl,
 #endif
-	.fops = {
-		.owner		= THIS_MODULE,
-		.open		= drm_open,
-		.release	= drm_release,
-		.unlocked_ioctl	= drm_ioctl,
-		.mmap		= drm_mmap,
-		.fasync		= drm_fasync,
-		.poll		= drm_poll,
-		.read		= drm_read,
-		.llseek		= noop_llseek,
-	},
+	.fops			= &lx_driver_fops,
+
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.date			= DRIVER_DATE,
@@ -2973,21 +3063,7 @@ static struct drm_driver lx_driver = {
 	.patchlevel		= DRIVER_PATCHLEVEL,
 };
 
-static int __devinit lx_pci_probe(struct pci_dev *pdev,
-				  const struct pci_device_id *ent)
-{
-	DRM_DEBUG_DRIVER("\n");
-	return drm_get_pci_dev(pdev, ent, &lx_driver);
-}
-
-static void __devexit lx_pci_remove(struct pci_dev *pdev)
-{
-	struct drm_device *dev = pci_get_drvdata(pdev);
-	DRM_DEBUG_DRIVER("\n");
-	drm_put_dev(dev);
-}
-
-static const struct pci_device_id __devinitconst pci_ids[] = {
+static const struct pci_device_id pci_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_LX_VIDEO) },
 	{ 0, }
 };
@@ -2996,16 +3072,18 @@ MODULE_DEVICE_TABLE(pci, pci_ids);
 static struct pci_driver lx_pci_driver = {
 	.name = DRIVER_NAME,
 	.id_table = pci_ids,
-	.probe = lx_pci_probe,
-	.remove = lx_pci_remove,
 };
 
+#ifndef CONFIG_PCI
+# error require CONFIG_PCI=y
+#endif
+
 static int __init lx_init(void) {
-	return drm_pci_init(&lx_driver, &lx_pci_driver);
+	return drm_legacy_pci_init(&lx_driver, &lx_pci_driver);
 }
 
 static void __exit lx_exit(void) {
-	drm_pci_exit(&lx_driver, &lx_pci_driver);
+	drm_legacy_pci_exit(&lx_driver, &lx_pci_driver);
 }
 
 module_init(lx_init);

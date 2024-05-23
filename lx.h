@@ -2,7 +2,12 @@
 #ifndef _LX_H_
 #define _LX_H_
 
-#include "drm_fb_helper.h"
+#include <linux/time.h>
+
+#include <drm/drm_encoder.h>
+#include <drm/drm_fb_helper.h>
+#include <drm/drm_framebuffer.h>
+#include <drm/drm_mm.h>
 
 #define DRIVER_AUTHOR		"Franz Brauße"
 
@@ -210,7 +215,7 @@ struct lx_priv {
 
 	/* used by irq-handler and get_vblank_timestamp:
 	 * temporary to keep the vblank timestamps as accurate as possible */
-	struct timeval      last_vblank;
+	ktime_t last_vblank;
 
 	/* singleton fbdev */
 	struct lx_fb        *fb;
@@ -242,7 +247,6 @@ extern void lx_ddc_cleanup(struct drm_device *dev);
 #define LX_MODE_MAX_VFREQ		100    /* in Hz */
 #define LX_MODE_FREQ_TOL		4000   /* in kHz */
 
-/* used for drm_display_mode's private_flags */
 #define LX_MODE_PFLAG_DOTPLL_MASK	0x17fff
 
 
@@ -699,6 +703,9 @@ enum vop_registers {
 
 
 /* register access functions */
+
+#define DRM_READ32(mmio, off)		readl((void __iomem *)mmio->handle + (off))
+#define DRM_WRITE32(mmio, off, val)	writel(val, (void __iomem *)mmio->handle + (off))
 
 static inline uint32_t read_gp(struct lx_priv *priv, int reg)
 {
