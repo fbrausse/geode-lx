@@ -6,6 +6,10 @@
 
 #include "lx.h"
 
+#ifndef CONFIG_I2C_ALGOBIT
+# error require CONFIG_I2C_ALGOBIT=y
+#endif
+
 #define GPIO_SCL 3
 #define GPIO_SDA 4
 

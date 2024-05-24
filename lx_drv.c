@@ -22,6 +22,8 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_modeset_helper.h>
+#include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -532,9 +534,9 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 
 	/* setup helper */
 	helper->fb = fb;
-	helper->fbdev = info;
+	helper->info = info;
 
-	info->flags = FBINFO_DEFAULT /*| FBINFO_VIRTFB*/;
+	info->flags = 0 /*| FBINFO_VIRTFB*/;
 	info->fbops = &lx_fb_ops;
 
 	info->fix.smem_start = bo->map->offset;
@@ -543,12 +545,6 @@ static int lx_fb_helper_probe(struct drm_fb_helper *helper,
 	info->screen_size = size;
 
 	drm_fb_helper_fill_info(info, helper, sizes);
-
-	info->apertures = alloc_apertures(1);
-	if (info->apertures) {
-		info->apertures->ranges[0].base = info->fix.smem_start;
-		info->apertures->ranges[0].size = size;
-	}
 
 	ret = fb_alloc_cmap(&info->cmap, 256, 0);
 	if (ret) {
@@ -605,14 +601,14 @@ static int lx_fbdev_init(struct drm_device *dev)
 
 	priv->fb = lfb;
 
-	drm_fb_helper_prepare(dev, &lfb->helper, &lx_fb_helper_funcs);
+	drm_fb_helper_prepare(dev, &lfb->helper, bpp, &lx_fb_helper_funcs);
 	ret = drm_fb_helper_init(dev, &lfb->helper);
 	if (ret) {
 		DRM_DEBUG_DRIVER("error init'ing fb_helper: %d\n", ret);
 		return ret;
 	}
 
-	drm_fb_helper_initial_config(&lfb->helper, bpp);
+	drm_fb_helper_initial_config(&lfb->helper);
 
 	return 0;
 }
@@ -621,7 +617,7 @@ static void lx_fbdev_fini(struct drm_device *dev)
 {
 	struct lx_priv *priv = dev->dev_private;
 	struct lx_fb *lfb = priv->fb;
-	struct fb_info *info = lfb->helper.fbdev;
+	struct fb_info *info = lfb->helper.info;
 
 	if (info) {
 		unregister_framebuffer(info);
@@ -2272,7 +2268,6 @@ static void lx_modeset_init(struct drm_device *dev) {
 	dev->mode_config.max_width = 1920;
 	dev->mode_config.max_height = 1440;
 	dev->mode_config.funcs = &lx_mode_funcs;
-	dev->mode_config.fb_base = priv->vmem_addr;
 
 	/* TODO: create & attach drm_device specific drm props */
 
@@ -3042,7 +3037,6 @@ static const struct drm_driver lx_driver = {
 	.postclose		= lx_driver_postclose,
 	.dumb_create		= lx_driver_dumb_create,
 	.dumb_map_offset	= lx_driver_dumb_map_offset,
-	.dumb_destroy		= lx_driver_dumb_destroy,
 
 	/* These are stubs ... */
 	.ioctls			= lx_ioctls,
